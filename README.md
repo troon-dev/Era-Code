@@ -45,6 +45,18 @@ This document is intentionally detailed. It explains the purpose of each major s
 - [User-data, cache, and file ownership](#user-data-cache-and-file-ownership)
 - [IPC/API catalogue for maintainers](#ipcapi-catalogue-for-maintainers)
 - [Static audit methodology and limits](#static-audit-methodology-and-limits)
+- [Extended module-by-module reference](#extended-module-by-module-reference)
+- [Application startup sequence and lifecycle details](#application-startup-sequence-and-lifecycle-details)
+- [Detailed profiler behavior and interpretation](#detailed-profiler-behavior-and-interpretation)
+- [Content update operation: detailed walkthrough](#content-update-operation-detailed-walkthrough)
+- [Download worker and disk-writer coordination](#download-worker-and-disk-writer-coordination)
+- [External URL handling and service boundaries](#external-url-handling-and-service-boundaries)
+- [Authentication callback and sensitive-data handling](#authentication-callback-and-sensitive-data-handling)
+- [Application updater and release integrity](#application-updater-and-release-integrity)
+- [UI state and renderer integration](#ui-state-and-renderer-integration)
+- [Privacy, telemetry, and support workflow](#privacy-telemetry-and-support-workflow)
+- [Suggested issue labels and triage categories](#suggested-issue-labels-and-triage-categories)
+- [Additional audit acceptance criteria](#additional-audit-acceptance-criteria)
 - [Final notes](#final-notes)
 
 ---
@@ -1227,6 +1239,222 @@ A follow-up dynamic test plan should use a disposable user-data directory, small
 10. Make development and packaging procedures reproducible and platform-specific.
 
 These priorities concern correctness, integrity, privacy, and transparent user feedback. They should be addressed before adding more visual polish or increasing the number of features advertised in the interface.
+
+
+
+## Extended module-by-module reference
+
+This reference is based on the checked-in files that can be inspected in this repository. Since several application components have been bundled into `app/index.js`, exact source-level names are not always available as separate files. Names and examples in this chapter should be understood as identifiers visible in the published bundle, not as a promise that a dedicated source module exists in the checkout.
+
+### Module map
+
+| Subsystem | Main location visible in the bundle | Main responsibility | Review focus |
+| --- | --- | --- | --- |
+| Application startup | `app/index.js` | Initialize Electron, integrations, protocol handlers, and window | Ordering, lifecycle, startup failures |
+| Preload bridge | `app/preload.js` | Expose renderer-callable functions | API consistency, listener cleanup, argument trust |
+| Launch manager | Bundled main process | Start and track the configured game process | State transitions and honest result reporting |
+| Profiler | Bundled main process | Walk selected directories and calculate fingerprints | Hash semantics and scan failures |
+| Client downloader | Bundled main process | Save an environment-specific client DLL | TLS verification, redirects, integrity |
+| Content updater | Bundled main process | Fetch a manifest and apply file changes | Path containment, resumable responses, rollback |
+| Download orchestrator | Bundled main process | Coordinate build downloads and worker activity | Cancellation, progress, incomplete files |
+| Disk writer | `app/workers/diskWriterWorker.js` | Allocate, write, synchronize, and verify file ranges | Write correctness and completion semantics |
+| Download workers | `app/workers/downloadWorker.js`, `downloadWorkerPooled.js` | Support high-volume download processing | Bounded concurrency, resource handling, cancellation |
+| Local report cache | Bundled main process | Save/read Wrapped report and accolade JSON | Schema validation and recovery |
+| Diagnostics | Bundled main process | Set Sentry context and record breadcrumbs | Data minimization and redaction |
+| Discord integration | Bundled main process | Connect RPC client and accept activity updates | Optional failure isolation and privacy |
+| Application updater | Bundled dependency and IPC handler | Check for updates and request installation | Package-specific configuration and rollback |
+
+This map is useful when triaging a bug. Start from the subsystem that owns the failing operation and then trace outward to the preload API, the renderer caller, and any service or worker it depends on.
+
+## Application startup sequence and lifecycle details
+
+The main process waits for Electron's ready event before setting its launcher diagnostic context, attempting to start the included helper executable if it exists, initiating the Discord RPC login, and creating the main application window. It also registers an activation handler that focuses an existing window or creates one if the window list is empty. When all windows close, the app quits on non-macOS platforms and tries to stop the helper process.
+
+This ordering matters for debugging because a failure may happen before the UI appears. For example, renderer assets cannot explain a problem that occurs while Electron is loading the main bundle or a native addon. Similarly, a window that opens successfully does not prove that the helper, Discord RPC, or game-launch functionality initialized correctly.
+
+### Startup diagnostics
+
+A startup diagnostic record should separate these milestones:
+
+1. Electron runtime entered the main bundle.
+2. The application acquired its single-instance lock.
+3. The ready event fired.
+4. Launcher context was initialized.
+5. The optional helper executable was found and started or a clear absence was recorded.
+6. Optional integrations were started.
+7. The renderer window was created and its assets loaded.
+8. The renderer became able to receive IPC events.
+
+Do not make startup depend on an optional integration being reachable. A Discord RPC login failure should not prevent the app window from opening. A missing helper should be reported as a specific diagnostic condition rather than being confused with a missing game executable or missing native addon.
+
+### Helper executable lifecycle
+
+The main process looks for the helper at a packaged-resource path and tries to spawn it if the file exists. At shutdown, it attempts to terminate the tracked helper process. That means packaging layout is part of the runtime contract: if the helper is copied somewhere else by a packaging step, the path must be updated consistently.
+
+The presence of `FortniteLauncher.exe` in the repository should not be interpreted as proof that it is a complete installer, updater, or game launcher on its own. The main bundle uses it in a specific helper/dummy-process role. Its origin and purpose should be documented by maintainers, and its hash should be checked against the expected release artifact before distribution.
+
+## Detailed profiler behavior and interpretation
+
+The profiler operates on a selected local build and visits the expected content PAK and plugin directories. It recursively collects paths for files it finds, calculates the values used by the current comparison workflow, and returns rows containing a filename and multiple fingerprints. If the main launch manager reports that the game is running, the analysis path logs that condition and stops rather than scanning concurrently.
+
+### Recursive walk behavior
+
+Recursive directory traversal is convenient because plugin folders and content folders can contain nested directories. It can also be expensive on large builds. The implementation should be tested with directories containing many small files, a few very large files, unreadable directories, symbolic links where supported, and paths with unusual Unicode characters.
+
+A robust scan should define what to do with unreadable files: stop and report a partial scan, skip and include a warning, or fail the complete operation. It should not label the results as complete when a subset of directories could not be read. If scans are later moved to workers, progress messages should include the number of files visited and the current phase, not just an unqualified completion percentage.
+
+### Fingerprint versioning
+
+When a fingerprint algorithm changes, the result format should include an algorithm/version identifier. Without that identifier, a value produced by an older launcher can be compared incorrectly with a value from a newer implementation. A stable comparison protocol should define the character encoding, filename normalization, case handling, byte ranges included, and hexadecimal output format.
+
+For any integrity-sensitive comparison, the result should be tied to a reference that the user can trust. A hash matching an untrusted remote manifest is only evidence that the local file matches that manifest; it does not establish that the manifest is legitimate.
+
+### Hash implementation summary
+
+| Operation | Input represented | What it is useful for | What it does not establish |
+| --- | --- | --- | --- |
+| Filename/size fingerprint | File basename and size | Fast identification when matching an existing protocol | Full content identity |
+| Partial SHA-256 fingerprint | A limited region near the end, plus basename and size | Lightweight comparison for a known protocol | Full-file integrity |
+| Shipping executable digest | Whole executable bytes, MD5 in this revision | Compatibility with a reference value that uses the same MD5 convention | Modern collision-resistant assurance |
+| Disk-writer chunk digest | Bytes in the requested chunk, MD5 in this revision | Detecting an unexpected chunk relative to a trusted expected digest | Integrity of other chunks or authenticity of the source |
+| Client DLL fingerprint | Whole local DLL bytes, MD5 in this revision | Comparing a local client file with a compatible reference | That the downloaded DLL was obtained securely |
+
+Never compare values from different rows as if they were the same algorithm. When a modern integrity guarantee is needed, define a new versioned format using a trusted full-file digest or a signed artifact manifest, and migrate consumers deliberately.
+
+## Content update operation: detailed walkthrough
+
+The current content updater requests a manifest URL, parses the response as JSON, reads the declared change list, and decides whether files should be kept, removed, or downloaded/updated. It places target content under the selected build's Fortnite PAK directory. For updates it checks a local fingerprint against the manifest value and skips a file if that value matches; otherwise it schedules the file for download. It then processes the scheduled downloads, sending progress events to the main window.
+
+### Progress data
+
+The progress payload visible in the implementation includes information such as the total expected size for the scheduled changes, the number of files in the update, the current file position, a current-file size, and a percentage derived from downloaded bytes and the current file's size. The exact meaning should be documented in the UI so users do not confuse current-file progress with whole-update progress.
+
+For example, a current-file percentage can reset when the next file begins. The UI may need to display both a per-file bar and an overall summary. If a file is already partially present, the count should account for bytes that have already been written only if those bytes are known to belong to the correct file and range.
+
+### Manifest and progress edge cases
+
+A production updater should explicitly handle an empty change list, a zero-byte file, a file without a declared size, an unknown change type, a duplicate filename, a missing hash, a response that returns the wrong content range, and a download that ends before the expected byte count. All of these conditions should have a documented outcome and should not be silently reported as success.
+
+The current implementation is useful to understand the intended content-update architecture, but static reading does not establish that all these edge cases are covered. They should be added as repeatable test cases before any claim of robust recovery or integrity verification is made.
+
+### Safe recovery after an interrupted update
+
+If a download is interrupted, preserve enough metadata to know which file was being updated, how many bytes were confirmed, which manifest was used, and whether the previous file was replaced. On the next attempt, validate the partial file and response range instead of assuming any existing file is resumable.
+
+Where an update may delete or replace local files, take a backup or create a staging directory first. Only promote the new result after all files needed for a consistent update have passed their checks. If transactional updating is not implemented, clearly state that the operation may leave a build partly updated and recommend using a copy that can be restored.
+
+## Download worker and disk-writer coordination
+
+The repository includes both regular and pooled download worker bundles, plus a disk writer worker. The presence of multiple worker scripts suggests alternative or pooled execution paths, but the actual concurrency policy should be confirmed from the orchestrator configuration before documenting a guaranteed number of concurrent requests.
+
+A common design is to separate fetching remote chunks from writing them to disk. The network worker retrieves bytes and associated metadata; the disk writer places chunks at offsets and reports write or verification outcomes; the orchestrator tracks the relationship between file indices, chunk indices, retries, and completion. The current disk-writer message format includes file and chunk indices, which allows a caller to correlate a response with the original task.
+
+### Worker contract requirements
+
+For a reliable pipeline, every task should have a unique or unambiguous identity. Every accepted task must produce a terminal response, including errors. Duplicate responses must not increment progress twice. An unknown message type should result in a clear protocol error instead of being ignored silently. The parent process must handle worker exits and errors and decide whether an unfinished task can be retried.
+
+Concurrency should be bounded by available memory, disk speed, server limits, and the target device. Large buffers can quickly consume memory when many requests are active. The orchestrator should avoid loading entire multi-gigabyte files into RAM; streaming or fixed-size chunks keep the memory profile predictable.
+
+### Durability versus verification
+
+The disk writer calls file synchronization periodically and while closing descriptors. Synchronization helps flush operating-system buffers to the filesystem, but it does not prove that the correct data was written. A successful write, successful synchronization, successful checksum verification, and successful whole-file validation are separate milestones.
+
+The response schema should reflect those differences. Avoid setting `verified: true` in a branch that only performed a write. If a checksum verification fails, the caller should mark the relevant chunk as invalid, retry it only according to an explicit retry policy, and prevent the overall file from being marked complete until all required chunks have passed verification.
+
+## External URL handling and service boundaries
+
+Several operations deal with URLs: opening an external browser, downloading a client DLL, fetching an update manifest, downloading content files, and checking application updates. Each route has its own trust requirements and should not accept arbitrary URLs merely because the renderer supplies one.
+
+### URL validation
+
+Before using an externally supplied URL, confirm that it uses an expected scheme, a valid hostname, and an approved destination. For a browser action, a typical safe design allows only intentional web schemes and rejects unexpected schemes that may invoke local handlers. For a binary download, prefer a fixed or allowlisted host and validate every redirect target as well as the initial URL.
+
+Manifest URLs and content file URLs should be reviewed separately. A manifest should not be able to redirect a privileged file-writing operation to an arbitrary host unless that behavior is a deliberate, authenticated part of the service protocol. Log sanitized host/path details, not signed query strings or access tokens.
+
+### Service availability
+
+A hard-coded service URL can become unreachable, change its response format, or stop serving an old build. An unavailable endpoint does not necessarily mean local files are broken. The launcher should distinguish DNS/TLS/connectivity failures from HTTP status errors, invalid JSON, an unknown manifest schema, missing content, and invalid local build paths.
+
+Where service configuration is environment-specific, document which environments exist and how they are selected without embedding secrets in public docs. Do not promise that development, staging, or production endpoints are accessible to every user.
+
+## Authentication callback and sensitive-data handling
+
+The main process parses a callback URL, extracts a `code` parameter, focuses the app window, and forwards the code to the renderer. The current implementation also writes the callback URL and code-related information to console output. Callback codes are sensitive short-lived credentials and should not be printed verbatim. Logs can be uploaded automatically, attached to bug reports, copied to shared channels, or stored for longer than expected.
+
+A better diagnostic policy records that a callback was received and whether a required parameter was present, without recording its value. On failure, record the category of the error, not the code itself. If a code has already been exposed, use the service's account-security process to invalidate or replace affected session credentials as appropriate.
+
+The custom protocol also needs robust parsing. A malformed URL should not crash the main process, and callbacks arriving before the window is ready should be handled deliberately. Where supported by the authentication protocol, verify the expected state value and ensure the callback belongs to the login flow the user actually initiated.
+
+## Application updater and release integrity
+
+The main process exposes a handler that requests an update check from Electron's updater and another event handler that calls the updater's install/restart function. These routes demonstrate integration points, but actual update availability depends on release metadata and packaging configuration. Running an update check does not mean an update is available, and requesting installation is not proof that the new version installed successfully.
+
+A release process should sign artifacts where supported, verify platform and version metadata, and keep the update feed separate from arbitrary user-provided URLs. Test with a staging release and a disposable installation before publishing a production update. Include failed download, corrupted update, no-update-available, permission-denied, and restart-required scenarios in the QA plan.
+
+If the application can update itself, the README and release notes should also explain whether the app restarts automatically, whether the user needs to close the game first, where pending update files are stored, and how to recover from a failed update. Only describe behavior that has been verified for the actual package format.
+
+## UI state and renderer integration
+
+The renderer receives progress and result events through the preload bridge. Because several operations are asynchronous, the visible interface should not rely on local button state alone to infer what the main process is doing. A request can be lost, rejected, cancelled, or finish after the component that started it has unmounted.
+
+### Recommended UI behavior
+
+- Disable duplicate start actions while an identical operation is running.
+- Show a clear operation label and the build identifier or sanitized name.
+- Distinguish file-download progress from verification and finalization.
+- Surface cancellation as a terminal state instead of leaving a stale spinner.
+- Show actionable errors, with a separate affordance for sanitized technical details.
+- Remove event listeners when a view no longer needs the event.
+- Recover from window recreation by re-querying operation state if such a state API exists.
+- Do not show success based only on a button click or on an IPC send being attempted.
+
+If the current API has no way to query the state of an operation after a view is recreated, a future improvement is to expose a narrowly scoped status query rather than making the renderer infer state from old events.
+
+## Privacy, telemetry, and support workflow
+
+The codebase contains Sentry-related setup and can attach launch or build context to diagnostic events. Support tooling should avoid collecting more data than needed. Build paths can reveal operating-system usernames; build identifiers can be associated with user activity; authentication callbacks may contain credentials. Review every field attached to a telemetry event and explicitly scrub sensitive values.
+
+A privacy-conscious support workflow uses a minimal diagnostic bundle that contains the app version, platform, architecture, an operation identifier, a sanitized error code, and the relevant sequence of state transitions. If the full path is useful, replace the user-specific prefix with a placeholder before sharing. Never include the client DLL, full game build, or authentication/session files in a public issue unless there is a legitimate and authorized reason and an approved secure exchange process.
+
+## Suggested issue labels and triage categories
+
+To make a growing project easier to maintain, bugs can be grouped into consistent categories:
+
+| Category | Examples | Initial investigation |
+| --- | --- | --- |
+| `startup` | Window does not open, renderer asset missing | App startup logs and asset paths |
+| `launch` | Process not found, early exit, native dependency error | Build path, process events, runtime compatibility |
+| `download` | Timeout, incomplete file, cancelled transfer | Manifest status, worker logs, destination permissions |
+| `content-update` | Unexpected deletion, hash mismatch, invalid manifest | Manifest schema, paths, backup/recovery state |
+| `profiler` | Scan fails or fingerprints differ | Directory permissions, algorithm/version, build metadata |
+| `auth` | Callback missing, rejected code, expired session | Protocol registration and sanitized response category |
+| `integrations` | Discord presence absent, Sentry unavailable | Optional integration config and logs |
+| `packaging` | Missing helper or native addon | Packaged resource paths and target ABI |
+| `security` | URL validation, TLS, secret exposure | Risk review, reproduction on test data, mitigation |
+| `documentation` | Incorrect instructions or stale claims | Compare README with current implementation |
+
+Triage should prioritize data-loss risk, credential exposure, unsafe remote file handling, and false success states above cosmetic issues. A good bug report should identify which subsystem owns the failure and whether any local files changed before the error appeared.
+
+## Additional audit acceptance criteria
+
+For the highest-priority fixes, define observable acceptance criteria rather than simply closing a ticket when code has changed.
+
+| Fix area | Suggested acceptance criteria |
+| --- | --- |
+| TLS verification | Invalid or untrusted certificates cause the client download to fail; no final DLL is marked ready |
+| Redirect handling | Redirect chains are bounded and every destination is validated; the final file is written only after a valid response |
+| Callback privacy | Logs and telemetry never include raw authorization codes or full sensitive callback URLs |
+| URL opening | Unexpected schemes are rejected and an invalid URL produces a clear, non-crashing error |
+| Manifest path containment | Paths are normalized and proven to remain inside the intended content directory before read/write/delete |
+| Resumable download | A range response must match the requested offset; a server ignoring Range triggers safe restart rather than blind append |
+| Disk writer | Allocation/write/verify have distinct results; allocation failure cannot be reported as verified success |
+| Launch outcome | Missing native dependencies and skipped operations cannot emit the same state as a verified successful operation |
+| Process closure | One child process generates one terminal UI state even if several Node process events fire |
+| Cache robustness | Invalid JSON is handled and recovery does not crash unrelated application features |
+| Listener cleanup | Repeated view mounting does not create duplicate event handling |
+| Packaging | A clean installation loads the expected assets and native component for the target platform |
+
+These are proposed tests, not statements about tests currently passing. Store any future test outcomes in CI or release documentation so maintainers can distinguish a recommended control from a validated control.
 
 
 ## Final notes
