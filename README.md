@@ -57,6 +57,12 @@ This document is intentionally detailed. It explains the purpose of each major s
 - [Privacy, telemetry, and support workflow](#privacy-telemetry-and-support-workflow)
 - [Suggested issue labels and triage categories](#suggested-issue-labels-and-triage-categories)
 - [Additional audit acceptance criteria](#additional-audit-acceptance-criteria)
+- [File-by-file implementation reference](#file-by-file-implementation-reference)
+- [Source-to-feature tracing guide](#source-to-feature-tracing-guide)
+- [Implementation status by confidence level](#implementation-status-by-confidence-level)
+- [Recommended remediation plan, ordered by risk](#recommended-remediation-plan-ordered-by-risk)
+- [Maintainer checklist for the next release](#maintainer-checklist-for-the-next-release)
+- [What static documentation can and cannot prove](#what-static-documentation-can-and-cannot-prove)
 - [Final notes](#final-notes)
 
 ---
@@ -1455,6 +1461,242 @@ For the highest-priority fixes, define observable acceptance criteria rather tha
 | Packaging | A clean installation loads the expected assets and native component for the target platform |
 
 These are proposed tests, not statements about tests currently passing. Store any future test outcomes in CI or release documentation so maintainers can distinguish a recommended control from a validated control.
+
+
+
+## File-by-file implementation reference
+
+This chapter is a navigation guide for maintainers working from the repository snapshot. It separates source files that can be read directly from generated bundles and compiled binaries that require different audit tools. It also explains what each file contributes to the user-visible launcher flow, what evidence can be inferred statically, and what remains unverified until the relevant workflow is tested.
+
+### `package.json` — package metadata and dependency declaration
+
+The package manifest names the package `era`, uses version `3.0.9` in this snapshot, identifies `app/index.js` as the entry point, and declares the JavaScript dependencies. It includes Electron-oriented packages, React and renderer dependencies, networking clients, error-reporting integrations, Discord RPC, and libraries for graphics, animation, UI components, data fetching, and charts.
+
+The current manifest has no `scripts` section. This is a significant development limitation: there is no npm-defined `start`, `dev`, `build`, or native rebuild command in the checked-in file. A user should not assume a familiar Electron command exists simply because the dependencies are installed. A maintainable project should restore the package scripts and document their required tools.
+
+Before changing dependencies, contributors should identify which runtime version the compiled application expects, whether a lockfile is present in the full repository, and which packages are actually imported by the main bundle or renderer. Avoid upgrading Electron or Node-adjacent dependencies casually while a compiled native addon is checked in; runtime changes can break that addon even when JavaScript still parses.
+
+### `app/index.js` — bundled Electron main process
+
+This is the main application entry point and a large bundled file. Its visible application-specific regions cover the launch manager, profiler, client downloader, content update worker, window and lifecycle management, IPC handlers, user-data cache, Discord RPC, Sentry context, and application updates. The file also contains substantial bundled third-party dependency code, so its total size should not be interpreted as the size of the project's original source logic.
+
+The main process is responsible for privileged work that the renderer cannot safely perform by itself: reading and writing local files, opening system dialogs, coordinating operating-system processes, invoking update functionality, and forwarding result events. A change in this file can therefore have consequences beyond the screen currently visible in the interface.
+
+Recommended maintenance approach:
+
+1. Identify the application-owned section before editing; do not treat bundled dependency code as application source.
+2. Trace the corresponding exposed API in `app/preload.js`.
+3. Find the matching IPC handler and its success/error behavior.
+4. Review filesystem effects, network requests, and process actions.
+5. Add a focused test or a reproducible manual test plan.
+6. Update this documentation if the public behavior or limitations change.
+
+Because this file is generated/bundled, edits made directly to it may be difficult to review and difficult to reproduce. Recovering the original source and build configuration should be a priority before larger refactors.
+
+### `app/preload.js` — controlled renderer API
+
+The preload exports a single API object and exposes it to the renderer as both `window.electron` and `window.electronAPI`. It groups methods by application/window control, browser opening and callbacks, library paths and hashes, build downloads, runtime checks, Wrapped cache, Sentry, game launch, profiler operations, client downloads, content updates, and generic IPC.
+
+The file is short enough to serve as the first navigation point for user-facing operations. When a UI control appears unresponsive, search for the method it calls, note whether it uses `send` or `invoke`, then follow the named channel into the main process. For subscriptions, confirm that event callbacks are removed when no longer needed.
+
+Important design considerations include:
+
+- Both global aliases point to the same API. New code should use one documented name consistently to avoid unnecessary ambiguity.
+- Some helper methods return no unsubscribe function, while other helpers do. This inconsistency can contribute to duplicate events if a component registers a listener repeatedly.
+- Some wrappers pass the Electron event object to the callback, while the generic `on` helper removes that event object and passes only the payload. Callback argument shape should be consistent and documented.
+- The generic `send`, `invoke`, and `on` helpers allow arbitrary channel names to be passed from the renderer. Keep this surface narrow or replace it with specific methods, and validate all payloads in the main process.
+- Paths, URLs, environment labels, credentials, build IDs, and file arrays are inputs, not trusted proof that the requested operation is safe.
+
+### `app/renderer/index.html` — renderer shell
+
+The HTML entry point defines the document language, viewport metadata, a font preconnect and stylesheet request, the title `Era V3`, the renderer root element, and references to compiled JavaScript and CSS assets. The UI is mounted into the root element by the compiled renderer bundle.
+
+The file references a favicon at `./src/favicon.svg`, while the visible checked-in tree is centered on compiled assets. Verify that the referenced icon exists in the actual checkout or package; if it does not, the browser may request a missing resource. The script and stylesheet use hashed asset names, so those paths must be regenerated alongside the renderer build rather than renamed by hand.
+
+The HTML shell is intentionally small. It does not describe the renderer's full component hierarchy or prove which screens are interactive. Those details are contained in the compiled renderer JavaScript and need to be traced from the relevant UI events.
+
+### `app/renderer/assets/index-Cmjydc3O.js` — compiled interface
+
+This is the main compiled renderer bundle. It contains generated application UI code and may include bundled dependencies. Because it is minified or generated, direct editing is not a sustainable development method: names are shortened, source module boundaries may be lost, and an asset rebuild can overwrite manual changes.
+
+For UI maintenance, recover the source components and original build process wherever possible. If only the bundle is available, make a copy before analysis, search for exact strings or labels, and verify any inferred UI path against the preload API. Do not assume a string appearing in the bundle is necessarily reachable in the current screen.
+
+### `app/renderer/assets/index-ByT-tuHS.css` — generated styling
+
+The stylesheet is a large compiled CSS asset. It supplies styling for the renderer rather than the application’s main-process behavior. Style changes should ideally be made in the original CSS or component source and regenerated. Changes to the compiled file can affect all screens that share the corresponding class names and may disappear during a future build.
+
+### Renderer artwork and 3D assets
+
+The asset directory includes images, icons, a GLB 3D asset, and other UI resources with generated or hashed filenames. Filenames indicate which files are included, but they do not establish which views reference them at runtime. Before deleting an apparently unused asset, search the compiled bundle and HTML/CSS references and test a complete packaged launch.
+
+Binary assets should be included in release review and tracked intentionally. Avoid replacing them with untrusted downloads or committing user data embedded in screenshots or image metadata.
+
+### `app/workers/diskWriterWorker.js` — file allocation and chunk I/O
+
+This worker uses Node's worker-thread message interface and synchronous filesystem operations. It maintains open file handles in a map, creates or opens destinations, prepares files to expected sizes, writes chunk buffers at offsets, verifies requested regions using an MD5 digest, and handles a shutdown message by attempting to sync and close handles.
+
+The visible message protocol includes `allocate`, `write`, `verify`, and `shutdown`, and the worker announces readiness after attaching its listener. For task-oriented messages, it can return completion information including file and chunk indices, or report an error with those indices.
+
+There are correctness details to preserve when this worker is modified. Allocation errors are caught inside the allocation helper; the caller must not assume that no thrown exception means successful allocation. The write path reports a completion flag that should not be confused with cryptographic verification. Verification is performed by a separate message type. The parent orchestrator must reconcile the responses rather than treating every `completed` message as identical.
+
+### `app/workers/downloadWorker.js` and `downloadWorkerPooled.js`
+
+These are large generated/bundled worker files. Their presence indicates that download work can be performed through worker implementations, including a pooled variant. They are large enough to contain bundled utility or dependency code, so the complete file size is not evidence of the size of the download algorithm itself.
+
+The exact number of active downloads, chunk scheduling policy, cancellation guarantees, and fallback behavior should be confirmed by tracing the orchestrator code in the main bundle. Do not document a guaranteed level of concurrency based solely on the word "pooled" in a filename. A production downloader should bound requests and buffers, associate each chunk with a task ID, handle worker exits, and refuse to complete a build while required chunks remain unverified.
+
+### `app/binaries/FortniteLauncher.exe` — Windows helper binary
+
+This checked-in executable is a Windows binary that the main process attempts to launch from a packaged resource path as a helper process. It is not source code and cannot be audited fully by reading the README or a JavaScript file. Its origin, signature, checksum, expected behavior, and licensing/redistribution status should be recorded by the maintainers.
+
+The main process also tries to stop its tracked helper process when the application exits through the relevant window lifecycle path. That shutdown behavior should be verified on each supported platform and package format. Do not infer a Linux-native implementation from the presence of this Windows executable.
+
+### `app/build/Release/dll_injector.node` — compiled native module
+
+The native addon is loaded by the Electron main process and is involved in the launch flow. It is a compiled binary, not a readable JavaScript module. Its compatibility depends on target operating system, CPU architecture, Electron/Node ABI expectations, required runtime libraries, and the code that calls its exports.
+
+The README can document the location and role of the module but cannot certify the behavior of its compiled code without additional binary/source analysis and runtime tests. Future releases should record a trusted digest and build provenance for this artifact. A missing or incompatible addon must produce an explicit unavailable/failure state, not a success-looking launch result.
+
+## Source-to-feature tracing guide
+
+The following examples describe how to trace a user-visible feature across the repository without assuming the UI and main process are always synchronized.
+
+### Trace a build download
+
+1. Find the renderer action that calls `startDownload`.
+2. Inspect the payload fields: build UUID, manifest URL, destination, and build metadata.
+3. Follow `startDownload` in the preload bridge to the `download:start` IPC event.
+4. Locate the main-process handler for that event.
+5. Trace how the final destination is chosen and the orchestrator is initialized.
+6. Identify how progress reaches the renderer and whether progress is per-file or overall.
+7. Follow cancellation into the active orchestrator and confirm workers actually stop.
+8. Inspect how errors reset the desktop progress bar and notify the UI.
+9. Verify final file integrity and the final result event before calling it a successful download.
+
+This is a trace checklist, not evidence that every state has already been tested.
+
+### Trace a content update
+
+1. Start with `checkForContentUpdate` in the preload bridge.
+2. Follow the `content-update:check` handler in the main process.
+3. Inspect the manifest fetch helper and its retry/timeout behavior.
+4. Confirm the schema expected for `changes`, file names, sizes, hashes, and change types.
+5. Check path normalization before any local file operation.
+6. Check the rules for skipping an existing file, downloading a new file, or deleting a file.
+7. Inspect the byte-range handling for partial downloads.
+8. Confirm that final size and hash are checked before completion is reported.
+9. Review the cancellation and rollback behavior for failure halfway through the update.
+
+### Trace a profiler request
+
+1. Find the UI caller of `analyzePaks`.
+2. Follow the `profiler:analyze` event and its main-process handler.
+3. Confirm the build path is the expected local build root.
+4. Check which directories are traversed and how inaccessible folders are reported.
+5. Confirm which hash implementation generated each column in the result.
+6. Verify the renderer knows the fingerprint algorithm/version and does not compare unlike values.
+7. Confirm that partial scan results are labeled as partial rather than complete.
+
+### Trace authentication callbacks
+
+1. Identify where the application initiates the supported login flow.
+2. Check how the custom `fluxapp` protocol is registered in development versus packaged mode.
+3. Follow the `open-url` handler and confirm malformed URLs are caught.
+4. Check whether callbacks arriving before window creation are queued safely.
+5. Confirm that the raw code is never written to logs.
+6. Confirm the renderer receives only the required callback data.
+7. Test exchange errors, expired callbacks, cancellation, and successful session validation with authorized development credentials.
+
+## Implementation status by confidence level
+
+Use a status vocabulary that prevents planned behavior from being confused with verified behavior. Suggested labels are:
+
+| Label | Meaning | Evidence required |
+| --- | --- | --- |
+| Code present | A relevant function or IPC route is present | Static source/bundle inspection |
+| Connected | The UI/preload/main handlers are wired together | Trace the full call path |
+| Runtime-tested | The code path was executed in a stated environment | Reproducible test result |
+| Failure-tested | One or more expected failures were exercised | Test logs and expected outcomes |
+| Security-reviewed | Inputs, filesystem effects, network trust, and secrets were reviewed | Review notes and remediation status |
+| Incomplete/stub | The function does not perform the advertised operation yet | Direct implementation inspection |
+| Unsupported | No compatible implementation is available for the target | Platform and dependency evidence |
+
+A feature may have more than one useful status. For example, a download IPC route may be code-present and connected while still not runtime-tested in the current environment. Avoid a single generic "working" label when it obscures these differences.
+
+## Recommended remediation plan, ordered by risk
+
+This plan proposes an order for future code fixes. It does not claim that the fixes have already been made.
+
+### P0 — Protect credentials and downloaded binaries
+
+- Stop logging raw authentication authorization codes and sanitize callback URLs before logging.
+- Restore TLS certificate validation for client downloads.
+- Restrict client download URLs and validate redirect destinations.
+- Verify downloaded binaries using a trusted digest or signature before treating them as available.
+- Review static token-like launch configuration and ensure no reusable secret is committed or passed unnecessarily through command-line arguments.
+
+### P1 — Prevent unintended filesystem changes
+
+- Normalize and validate manifest file names before creating, reading, replacing, or deleting files.
+- Ensure every resolved target remains inside the selected build's allowed content directory.
+- Verify byte-range response headers before appending to a partial file.
+- Validate manifest shape, file sizes, change types, duplicate paths, and expected digests before mutating the build.
+- Make destructive updates recoverable, or clearly warn when a rollback is unavailable.
+
+### P1 — Make results truthful
+
+- Give launch operations structured results for process creation, dependency status, and observed termination.
+- Do not report injection or launch success when a required dependency was skipped.
+- Make close handling idempotent so multiple process events produce one terminal UI state.
+- Separate disk allocation, write, chunk verification, and full-file verification results.
+- Ensure an allocation error cannot be followed by a success message that says the file is verified.
+
+### P2 — Improve observability and maintainability
+
+- Standardize IPC payload/result contracts and error formats.
+- Make every listener registration return an unsubscribe function.
+- Avoid generic IPC routes when a specific safe method is sufficient.
+- Add tests for retry behavior, malformed manifests, network interruptions, and cache corruption.
+- Recover source files and repeatable build scripts for the bundled renderer and main process.
+- Record supported runtime/ABI combinations and build provenance for native binaries.
+
+### P3 — Improve developer experience
+
+- Add a tested setup guide and scripts for development, linting, tests, and packaging.
+- Add CI checks for JavaScript syntax, source formatting, generated artifacts, and dependency review.
+- Keep the contents list synchronized with the section headings.
+- Include a small synthetic manifest and fixture files for safe update/profiler tests.
+- Add release notes that identify the exact features tested and the limitations that remain.
+
+## Maintainer checklist for the next release
+
+Use this checklist for a future release candidate. Items should only be marked complete when there is evidence from the target build.
+
+- [ ] The package scripts and build process are available from a clean checkout.
+- [ ] The supported Electron, Node, operating system, and architecture matrix is published.
+- [ ] The helper executable and native addon have verified provenance.
+- [ ] The client downloader uses normal TLS validation and safely handles redirects.
+- [ ] Authentication codes and sensitive URLs are redacted in logs.
+- [ ] External browser URLs are checked against an explicit scheme policy.
+- [ ] Manifest paths cannot escape the intended build directory.
+- [ ] Resumed downloads verify that the server returned the requested byte range.
+- [ ] Full-file integrity is verified with a trusted expected digest or signature.
+- [ ] Cancellation closes network streams, worker tasks, and file handles.
+- [ ] Failure events never look like successful completion events.
+- [ ] The same process does not cause repeated terminal launch notifications.
+- [ ] The PAK-disable stub is clearly marked in the UI or completed and tested.
+- [ ] Corrupt caches and missing optional integrations do not crash the application.
+- [ ] Logs and telemetry do not contain secrets or unnecessary personal data.
+- [ ] A clean installation and the documented update workflow have been tested.
+- [ ] The README describes what was actually tested, not only intended behavior.
+
+## What static documentation can and cannot prove
+
+The README is based on visible code, declarations, and file structure. It can explain which handlers exist, how they are wired, what inputs they appear to use, and what error-handling patterns are visible. Static inspection cannot prove that a remote API is currently online, that a provided credential is valid, that a native binary behaves safely, or that a game build is accepted by an external service.
+
+For this reason, future audit notes should cite the relevant file and function, identify the evidence type, and distinguish a confirmed code pattern from a hypothesis that requires a runtime test. A good issue should include a minimal reproduction and sanitized evidence. Large output dumps, secrets, private service data, and full proprietary game content should not be attached.
+
+When a limitation is fixed, remove or revise the old warning only after confirming the replacement behavior. When a new feature is added, list its entry point, inputs, outputs, platform assumptions, data changes, error states, and test coverage. Keeping that evidence attached to the documentation will make the next README expansion more accurate and useful.
 
 
 ## Final notes
