@@ -100,8 +100,9 @@ test("write and verify messages report separate outcomes", async (t) => {
     type: "write",
     task: { filePath, buffer: payload, offset: 0, expectedSize: payload.length, fileIndex: 0, chunkIndex: 0 },
   });
-  const writeResult = await nextMessage((message) => message.type === "completed" && message.fileIndex === 0 && message.chunkIndex === 0);
-  assert.equal(writeResult.verified, true, "write acknowledgement reflects current protocol; verify is checked separately");
+  const writeResult = await nextMessage((message) => message.type === "completed" && message.operation === "write" && message.fileIndex === 0 && message.chunkIndex === 0);
+  assert.equal(writeResult.written, true);
+  assert.equal(writeResult.verified, false, "writing bytes is not the same as verifying their checksum");
 
   worker.postMessage({
     type: "verify",
