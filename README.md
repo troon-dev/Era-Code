@@ -781,6 +781,200 @@ The application stores Wrapped report and accolade JSON files beneath a subdirec
 
 No. A public repository can help people review source, but it does not independently certify the safety of compiled executables, native modules, remote download endpoints, or application behavior. Inspect and test the exact revision and binaries you intend to run.
 
+
+## Deep-dive: how to maintain the launcher as a dependable desktop product
+
+This chapter expands the operational documentation with implementation expectations, failure handling, data-flow guidance, and maintainership practices. It is intended to help contributors understand what a reliable launcher should guarantee. Recommendations below are not claims that the current bundled revision already satisfies every requirement.
+
+### 1. User action to completed operation
+
+Every action in the interface should have a traceable path from the control the user activates to the operation that actually runs. For example, a "Download" control should validate the selected build, create a request, pass that request through the preload bridge, start the download worker, receive progress events, verify the files, and finally show a terminal status. If any stage fails, the interface should report the stage that failed instead of leaving a spinner active forever.
+
+This principle is equally important for launching. A click should not immediately become a "Game running" state. The UI should first show that the request was accepted, then that the path was checked, then that process creation succeeded, and finally that the process remains alive. If the application cannot reliably observe a later game initialization stage, the UI should say "Process started" rather than claiming "Game ready."
+
+The same rule applies to update checks, authentication callbacks, client downloads, cache refreshes, and application updates. The user-facing status should correspond to the strongest state the code has actually verified.
+
+### 2. Recommended operation state model
+
+A long-running operation benefits from a small explicit state model. One recommended pattern is:
+
+- `idle`: no operation is active.
+- `validating`: input, destination, manifest, or build metadata is being checked.
+- `queued`: the request is accepted and waiting for a worker.
+- `running`: active work is in progress.
+- `verifying`: transferred data or operation results are being checked.
+- `completed`: the expected completion criteria have passed.
+- `cancelled`: the user or application intentionally stopped the operation.
+- `failed`: an error prevented completion.
+
+The state model should reject impossible transitions. A cancelled operation must not later be overwritten by a delayed progress event that marks it as completed. A failure should not silently return to running unless an explicit retry creates a new attempt. A second launch request should be handled deliberately: either rejected with a clear message or queued according to documented behavior.
+
+### 3. Progress reporting that users can trust
+
+Progress bars should communicate the type of progress being measured. Network bytes received, files completed, integrity verification, and finalization are different measures. A progress bar reaching 100% of bytes does not mean all files have been verified or promoted into their final paths.
+
+If the total size is unknown, show indeterminate progress rather than fabricating a percentage. If one file is retried, avoid moving the progress indicator backwards without explanation. If cancellation occurs, immediately stop presenting the task as active while the underlying worker performs safe cleanup.
+
+For multi-file operations, report both overall progress and the current file when that information is available. Avoid emitting an IPC event for every tiny byte chunk if it overwhelms the renderer; progress can be throttled while preserving meaningful updates.
+
+### 4. Logging levels and correlation IDs
+
+Logs should distinguish routine diagnostics from warnings and failures. A practical set of levels is debug, info, warn, and error. Debug logs can include detailed state transitions during development; info logs can record operation start and finish; warnings can identify recoverable problems; errors should include enough context to understand why an operation failed.
+
+For complex workflows, a correlation ID helps connect the initial request to worker messages, retries, verification, and the final result. The ID should be random or otherwise non-sensitive and should not contain a token, username, or account secret. When a user submits a sanitized log, maintainers can follow a single operation without requiring the user's entire log history.
+
+Never log authorization headers, passwords, cookies, raw session tokens, or full callback URLs containing codes. Scrub sensitive query parameters before recording URLs. Prefer stable error codes and sanitized relative paths over raw server responses or absolute user paths.
+
+### 5. Timeout and retry policy
+
+Every network operation should have a defined timeout or cancellation mechanism. Without one, an unavailable endpoint can leave a UI action active indefinitely. Timeouts should be selected based on the operation: a small metadata request and a large file transfer should not necessarily share the same deadline.
+
+Retries should be limited and should use a backoff policy for transient failures. They should not automatically retry malformed data, a permanent authorization error, a missing file, an invalid certificate, or a rejected manifest. When the retry budget is exhausted, return a clear failure result and preserve diagnostic context.
+
+The retry policy should also consider shutdown. Closing the application should stop scheduled retries, close active streams, and wait only as long as is reasonable for cleanup. A background retry should never unexpectedly restart a user-cancelled operation.
+
+### 6. Filesystem changes as transactions
+
+Operations that create, replace, or delete files should make their effects predictable. A safer update design downloads to a temporary file, validates its size and digest, then atomically renames it into place where the platform supports that operation. If validation fails, the previous good file should remain intact.
+
+For updates that affect many files, consider a transaction journal that records which files were prepared, replaced, or deleted. If the process crashes, the next startup can detect an incomplete transaction and offer recovery rather than guessing whether the build is valid. Destructive changes should be logged with relative paths and should not cross the selected build root.
+
+A rollback mechanism should be tested, not merely described. If a rollback is impossible for a particular operation, explain that limitation before the user starts it and recommend a backup.
+
+### 7. Manifest validation checklist
+
+Before acting on a manifest, validate the structure and meaning of every entry:
+
+1. Confirm the manifest comes from the configured, trusted source.
+2. Confirm the document has the expected schema version.
+3. Reject missing or wrongly typed fields.
+4. Normalize and validate every filename.
+5. Reject absolute paths and parent-directory traversal.
+6. Check that each URL uses an allowed scheme and trusted host.
+7. Enforce reasonable file-size and total-download limits.
+8. Reject duplicate or conflicting operations for the same destination.
+9. Require a trusted digest for files where integrity verification is expected.
+10. Treat delete instructions as destructive operations that require strict path confinement.
+11. Verify the final file after download.
+12. Record the manifest version or digest used for the operation.
+
+The current code expects structured manifest information, but this list describes the stronger validation that a production updater should enforce.
+
+### 8. Launch diagnostics checklist
+
+When the launch flow fails, collect evidence in a consistent order:
+
+1. Confirm the selected build directory is the intended directory.
+2. Confirm the expected executable exists at the path the launcher constructs.
+3. Confirm the executable and required files are readable.
+4. Confirm the native addon loaded successfully and matches the current runtime.
+5. Confirm required operating-system dependencies are present.
+6. Confirm the environment and build metadata are valid.
+7. Record whether process creation returned an error or a process identifier.
+8. Record whether the process stayed alive or exited immediately.
+9. Inspect sanitized application logs and any game-generated logs available to the user.
+10. Reproduce the problem with a disposable, authorized test build when possible.
+
+Do not skip directly to disabling security software, changing anti-cheat settings, or replacing native binaries. Such workarounds can hide the real problem and may violate the rules of the service being used.
+
+### 9. Native module compatibility
+
+A compiled Node.js addon is coupled to more than its filename. Compatibility may depend on the operating system, CPU architecture, Electron version, Node ABI, C/C++ runtime, external libraries, and build flags. Packaging a Windows addon inside a Linux application does not make it a Linux addon, and copying a module from an unrelated Electron release may produce a load error or unstable behavior.
+
+A maintainable release pipeline should record the toolchain and target for each native binary. Where possible, build from reviewed source in a reproducible environment. Store checksums for release artifacts and ensure that the packaged application loads the intended binary path. If a native feature is unavailable, the application should disable only the dependent feature and explain why.
+
+### 10. Cross-platform support boundaries
+
+A framework may support multiple operating systems while a particular application feature remains platform-specific. Electron's availability on Linux, Windows, and macOS does not establish that every helper executable, registry query, process argument, filesystem assumption, or native addon works on all of them.
+
+For each supported platform, maintain a clear compatibility table with tested operating system versions, architectures, Electron versions, native module availability, and known restrictions. If Linux is not supported for game launching in the current revision, say so directly instead of implying that a successful window launch proves full compatibility.
+
+A genuine port should separate platform-specific operations behind a clear interface and implement each target independently. It should also test path separators, permissions, process lifecycle, packaging paths, and shutdown behavior on the target operating system.
+
+### 11. Authentication flow observability
+
+Authentication consists of multiple independent stages: the user starts the login flow, the browser or service handles the request, a callback is sent to the custom protocol, the running app receives the callback, the renderer is notified, the authorization code is exchanged through the expected service flow, and the resulting session is validated. A callback being received proves only that the callback stage was reached.
+
+The app should provide different diagnostics for callback registration errors, missing callback parameters, service rejection, expired codes, network failures, and session restoration failures. Do not print authorization codes in logs to make debugging easier. Test authentication with dedicated accounts and environments approved for development, not with credentials copied from another person.
+
+### 12. Application updates and rollback
+
+An application updater should verify that release metadata matches the intended product and platform, download artifacts from the expected source, and handle interrupted updates without leaving the installation unusable. Users should be able to distinguish "update available," "downloading," "downloaded," "installing," "restart required," and "updated successfully."
+
+A failed updater request should not be reported as a successful update. For a packaged app, verify that the updater configuration matches the distribution method and that the application has permission to write to its installation location. When an update changes the cache schema or native modules, document migration and rollback behavior.
+
+### 13. Accessibility and usability
+
+A desktop launcher should remain understandable without relying only on color, animation, or tiny status text. Controls should have meaningful labels, keyboard navigation should be predictable, errors should be announced clearly, and progress should have text alternatives. Long operations need a clear cancel action where cancellation is safe, and destructive operations should explain what they will change.
+
+The renderer includes UI libraries that can support accessible components, but accessibility still depends on how the components are composed and labeled. Test keyboard-only navigation, high-DPI scaling, reduced-motion preferences where practical, long build names, narrow windows, and error messages that wrap across multiple lines.
+
+### 14. Performance and resource usage
+
+Large build scans and downloads should not block the renderer. File hashing can be CPU- and disk-intensive, especially for large folders. Workers should have a bounded concurrency level and should avoid opening too many files at once. Excessive concurrency may reduce throughput on slower disks or cause resource exhaustion.
+
+Measure performance with representative test data rather than choosing arbitrary worker counts. Track elapsed time, bytes processed, file counts, and peak memory where practical. Avoid sending large arrays of profiler results repeatedly through IPC when a compact summary or paginated result would suffice.
+
+The UI should remain responsive while work proceeds. If a scan can take several minutes, provide status updates and a safe cancellation path. If a worker fails, report which files were not inspected rather than silently treating partial results as a complete scan.
+
+### 15. Dependency and supply-chain maintenance
+
+The dependency manifest is part of the application's security and reproducibility story. Maintain a lockfile when appropriate, review dependency updates, and test native modules after changing Electron or Node versions. Avoid installing packages merely to silence an error without understanding why the package is required.
+
+Release automation should avoid pulling unpinned code at packaging time. Document the toolchain, preserve build logs, and verify the artifacts that are actually shipped. A dependency being popular or available from a package registry is not a guarantee that a particular version is safe or compatible.
+
+### 16. Documentation standards for future features
+
+Every new feature should document five things: purpose, entry point, inputs, outputs, and failure behavior. If it modifies files, state which files may change and whether a backup is recommended. If it uses a remote service, document the configuration requirements and the expected response shape without publishing secrets. If it is platform-specific, list the supported platforms.
+
+A feature should not be described as complete merely because a button, IPC route, or function name exists. Prefer labels such as "implemented but unverified," "verified on Windows," "stub," or "planned" when those distinctions are relevant. Update the feature matrix when the implementation changes.
+
+### 17. Extended QA scenarios
+
+The following scenarios can be used to build a repeatable test suite:
+
+- Start the application with a clean user-data directory.
+- Start the application when the renderer cache is already populated.
+- Start two instances and confirm the single-instance behavior.
+- Deliver a malformed deep link and confirm that no secret is logged.
+- Attempt a launch with a nonexistent directory.
+- Attempt a launch with the executable missing.
+- Attempt a launch with a native addon that cannot be loaded.
+- Launch a disposable test process that exits immediately.
+- Start a small download and cancel it midway.
+- Simulate a network timeout during a metadata request.
+- Simulate a truncated file response.
+- Provide a manifest with an invalid digest.
+- Provide a manifest with a path traversal attempt.
+- Provide a manifest containing duplicate destination entries.
+- Simulate a disk-full error while writing a file.
+- Interrupt an update between download and final rename.
+- Read a corrupt JSON cache.
+- Run without Discord available.
+- Run while telemetry endpoints are unavailable.
+- Test update metadata for the wrong platform.
+- Confirm that all terminal states clear progress indicators and listeners.
+
+Each scenario should define expected logs, expected UI state, filesystem effects, and whether the operation can be safely retried. Automated tests should use small fixtures and mocked services where possible.
+
+### 18. Definition of done
+
+A change is ready to merge when the implementation, error handling, documentation, and tests agree. A practical definition of done includes:
+
+- The intended behavior is described and reviewable.
+- Inputs are validated at the privileged boundary.
+- Failure cases have useful, non-sensitive diagnostics.
+- Long-running work has a terminal state and cleanup path.
+- File operations stay within the intended directory.
+- Tests cover the main success path and important failure cases.
+- Platform assumptions are explicit.
+- No credentials or private user data are committed.
+- The README describes the actual behavior rather than an aspirational version.
+- Any known limitation introduced by the change is documented.
+
+This standard reduces the chance that the application appears functional in the happy path while leaving users with corrupted builds, stuck progress indicators, unclear launch failures, or leaked diagnostic data.
+
+
 ## Final notes
 
 Era combines a desktop interface with game-build downloads, local file analysis, process launch coordination, deep-link handling, telemetry, and third-party integrations. The project has a substantial bundled application implementation, but a useful technical README must explain both the intended workflows and the concrete limits of the checked-in code.
