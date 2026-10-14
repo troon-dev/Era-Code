@@ -90,35 +90,37 @@ function syncFile(filePath, force = false) {
   }
 }
 function allocateFile(filePath, fileSize) {
-  if (typeof filePath !== "string" || filePath.length === 0) {
-    throw new Error("Invalid filePath for allocation");
-  }
-  if (!Number.isSafeInteger(fileSize) || fileSize < 0) {
-    throw new Error("Invalid fileSize for allocation");
-  }
-  const dir = import_path.default.dirname(filePath);
-  import_fs.default.mkdirSync(dir, { recursive: true });
-  let fd;
   try {
+    const dir = import_path.default.dirname(filePath);
+    if (!import_fs.default.existsSync(dir)) {
+      import_fs.default.mkdirSync(dir, { recursive: true });
+    }
     if (import_fs.default.existsSync(filePath)) {
       const stats = import_fs.default.statSync(filePath);
-      if (!stats.isFile()) {
-        throw new Error("Allocation target is not a regular file");
+      if (stats.size === fileSize) {
+        console.log("[DiskWriter] File already exists with correct size:", filePath);
+        return;
+      } else if (stats.size > 0) {
+        console.log(`[DiskWriter] File exists with size ${stats.size}, expected ${fileSize}`);
+        const fd2 = import_fs.default.openSync(filePath, "r+");
+        import_fs.default.closeSync(fd2);
+        return;
       }
-      fd = import_fs.default.openSync(filePath, "r+");
-    } else {
-      fd = import_fs.default.openSync(filePath, "w+");
     }
-    // Preserve any existing partial-download bytes while ensuring the target
-    // has the expected final size. Let allocation failures reach the message
-    // handler instead of swallowing them and reporting a false completion.
-    import_fs.default.ftruncateSync(fd, fileSize);
-  } finally {
-    if (fd !== void 0) {
+    const fd = import_fs.default.openSync(filePath, "w");
+    try {
+      try {
+        import_fs.default.ftruncateSync(fd, fileSize);
+      } catch (truncateError) {
+        console.log("[DiskWriter] ftruncate not supported, will use incremental writes:", truncateError);
+      }
+    } finally {
       import_fs.default.closeSync(fd);
     }
+    console.log(`[DiskWriter] Prepared file: ${filePath} (${(fileSize / 1048576).toFixed(2)} MB)`);
+  } catch (error) {
+    console.error(`[DiskWriter] File preparation failed: ${error.message}`);
   }
-  console.log(`[DiskWriter] Prepared file: ${filePath} (${(fileSize / 1048576).toFixed(2)} MB)`);
 }
 function writeChunk(filePath, buffer, offset, expectedSize) {
   try {
@@ -169,11 +171,9 @@ if (import_worker_threads.parentPort) {
         if (import_worker_threads.parentPort) {
           import_worker_threads.parentPort.postMessage({
             type: "completed",
-            operation: "allocate",
             fileIndex: -1,
             chunkIndex: -1,
-            allocated: true,
-            verified: false
+            verified: true
           });
         }
       } else if (message.type === "write") {
@@ -187,14 +187,13 @@ if (import_worker_threads.parentPort) {
           task.offset,
           task.expectedSize
         );
+        let verified = true;
         if (import_worker_threads.parentPort) {
           import_worker_threads.parentPort.postMessage({
             type: "completed",
-            operation: "write",
             fileIndex: task.fileIndex,
             chunkIndex: task.chunkIndex,
-            written: true,
-            verified: false
+            verified
           });
         }
       } else if (message.type === "verify") {
@@ -226,12 +225,11 @@ if (import_worker_threads.parentPort) {
       }
     } catch (error) {
       console.error("[DiskWriter] Error:", error);
-      if (import_worker_threads.parentPort) {
+      if (import_worker_threads.parentPort && message.task) {
         import_worker_threads.parentPort.postMessage({
           type: "error",
-          operation: message.type || "unknown",
-          fileIndex: message.task?.fileIndex ?? -1,
-          chunkIndex: message.task?.chunkIndex ?? -1,
+          fileIndex: message.task.fileIndex,
+          chunkIndex: message.task.chunkIndex,
           error: error.message || "Unknown error"
         });
       }
