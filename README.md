@@ -40,6 +40,11 @@ This document is intentionally detailed. It explains the purpose of each major s
 - [Contributing](#contributing)
 - [Reporting a bug](#reporting-a-bug)
 - [Frequently asked questions](#frequently-asked-questions)
+- [Code-level audit: additional findings from the checked-in implementation](#code-level-audit-additional-findings-from-the-checked-in-implementation)
+- [Disk writer worker: detailed behavior](#disk-writer-worker-detailed-behavior)
+- [User-data, cache, and file ownership](#user-data-cache-and-file-ownership)
+- [IPC/API catalogue for maintainers](#ipcapi-catalogue-for-maintainers)
+- [Static audit methodology and limits](#static-audit-methodology-and-limits)
 - [Final notes](#final-notes)
 
 ---
@@ -973,6 +978,255 @@ A change is ready to merge when the implementation, error handling, documentatio
 - Any known limitation introduced by the change is documented.
 
 This standard reduces the chance that the application appears functional in the happy path while leaving users with corrupted builds, stuck progress indicators, unclear launch failures, or leaked diagnostic data.
+
+
+
+## Code-level audit: additional findings from the checked-in implementation
+
+This audit section goes beyond the feature overview and records noteworthy behavior visible in the bundled main process, preload bridge, and disk-writing worker. It is a static code review, not a dynamic security assessment. A finding indicates that a code pattern exists in this revision; runtime behavior can still depend on timing, Node/Electron versions, operating system, server responses, and files present on disk.
+
+### Severity and scope
+
+| Area | Observation | Why it matters |
+| --- | --- | --- |
+| Client DLL download | HTTPS certificate validation is disabled in the request options | The server identity is not properly verified by that request, increasing interception risk |
+| Authentication callback | The callback code is written to console output | Authorization codes are sensitive, and logs may be shared or uploaded |
+| Content update | Manifest-provided names are joined to a local PAK directory without an evident containment check in this function | A malformed or untrusted manifest could resolve paths outside the intended directory |
+| Content update resume | Existing file size is used to request a byte range; response handling accepts both 200 and 206 while appending when a partial file exists | A server that ignores the range request may cause duplicate bytes to be appended |
+| Native launch result | Some missing-dependency branches still call the callback used for the “injected” result | The UI can receive a positive-looking event even when the native operation did not occur |
+| Process lifecycle | Both `exit` and `close` handlers call the same close callback | The renderer may receive duplicate game-close notifications |
+| Launch diagnostics | Child process stdio is configured as ignored | Errors emitted by the child process are not captured through those pipes by this code path |
+| Disk writer | Allocation catches its own error, after which the message handler can still send a completed response with `verified: true` | A completion response should not be interpreted as proof that allocation succeeded |
+| Disk writer | A write task reports `verified: true` immediately after the write; byte verification is a distinct message type | Writing and verifying should be represented as distinct states |
+| Runtime check | The Visual C++ check returns true on non-Windows systems because the Windows-specific check is skipped | A true result on Linux/macOS should not be interpreted as proof of a Windows runtime installation |
+| External browser | The main-process handler forwards a renderer-provided URL to `shell.openExternal` without an obvious allowlist at that handler | External URL schemes should be validated before opening them |
+| Package metadata | The current package file does not contain the normal start/build scripts | A reproducible developer workflow cannot be inferred from the package manifest alone |
+
+The purpose of documenting these findings is to make future fixes and tests easier to prioritize. The README does not provide instructions for bypassing anti-cheat systems or exploiting malformed manifests.
+
+### Launch callback semantics need improvement
+
+The launch manager is expected to report whether a launch-related operation succeeded. In this revision, branches that detect a missing native injector or a missing client DLL still invoke the callback named for the injection result. This makes the callback ambiguous: a renderer might receive the same event whether injection occurred or whether it was skipped because a dependency was absent.
+
+A better contract would return a structured result with explicit fields such as a status code, a user-safe message, and an optional diagnostic identifier. For example, a result should distinguish “process spawned,” “native module unavailable,” “client DLL missing,” “injection failed,” and “process exited.” Each result should be based on an actual check, not simply on reaching the end of a callback branch.
+
+This section describes a correctness problem, not a replacement implementation for the injection logic. The safest next step is to define unambiguous launch-result semantics and test them in an authorized environment.
+
+### Process exit events should be idempotent
+
+The launch path attaches handlers to both the child process's `exit` event and its `close` event, and both paths call the close callback. Those events represent different process/stdio lifecycle moments and can both occur for one process. A consumer should not assume the callback runs exactly once.
+
+A robust state machine should make the transition out of “running” idempotent. The first valid terminal event can mark the session as ended; later related events should enrich the diagnostic record without sending a second user-visible terminal notification. Tests should confirm that one launched process leads to one final close state, even if more than one low-level event fires.
+
+### The launch result is not an independent health check
+
+The launch handler records build metadata and then invokes the launcher. The launch manager may be able to observe process creation, a process ID, and termination; those are useful observations, but they do not demonstrate that a complete game session initialized or that a service accepted the session. The README should not equate DLL-related callbacks, process creation, or a missing exception with a validated playable session.
+
+For ordinary diagnostic purposes, maintainers should label the state that was actually observed. If a later initialization signal is not available, state that limitation rather than inferring success from process creation.
+
+### Command-line arguments and sensitive values
+
+The launch code assembles command-line arguments and includes values derived from the supplied launch token, as well as a hard-coded launcher token and flags that affect game startup behavior. Command-line arguments can sometimes be inspected by local diagnostic tools and may appear in crash reports or process listings. Credentials should not be placed in command-line arguments when a safer supported transport is available.
+
+The hard-coded launch configuration should be reviewed by the maintainers, especially any static token-like value and any argument that disables or changes an anti-cheat-related behavior. This README deliberately does not reproduce those values or describe how to use them. Do not use the launcher to bypass anti-cheat controls or to access a service outside its rules. A future safe design should remove embedded secrets, use supported authentication flows, and avoid claiming support for unsupported or prohibited launch configurations.
+
+### The credentials field is passed but not consumed by the shown launch function
+
+The IPC handler calls the launch function with a credentials property, but the visible launch function destructures only the build path, token, environment, and callbacks. The credentials property is not used by that function body. This may be legacy API shape or an incomplete flow; the checked-in code does not establish that the credentials object affects process creation.
+
+If a value is part of a public API but unused, maintainers should either connect it to a documented, authorized workflow or remove it from the contract after checking all renderer callers. Leaving unused authentication parameters in the interface can confuse debugging and lead users to believe that a value is being applied when it is not.
+
+### Native-module failures must not be reported as success
+
+Loading the native addon is attempted during module initialization. If loading fails, the error is logged and the application can continue to initialize. Continuing with a reduced set of features can be a reasonable design, but dependent actions must be visibly disabled or return explicit unavailable errors.
+
+The current launch path's callback behavior makes this distinction particularly important. The UI should not receive a success-looking result just because the application handled the failure without throwing. A clear dependency status, a structured error result, and a test for the missing-module case would make support substantially more reliable.
+
+### Child-process diagnostics are limited
+
+The game process is spawned with its standard input, standard output, and standard error ignored. That may avoid mixing the game's console output with the launcher's output, but it also means the launch manager is not reading the child's output from those streams. Debugging a process that exits immediately therefore requires other diagnostic sources.
+
+The application should log the exit code and distinguish process-creation errors from post-start exits. If a supported development workflow can safely capture diagnostics, it should redact secrets and avoid storing unbounded output. A missing process identifier, a synchronous spawn failure, and a normal process exit are different failure classes and should be presented separately.
+
+### Client DLL download behavior
+
+The client downloader chooses a filename based on the requested environment and writes the response to a file beneath the app-specific user-data directory. It reports progress when response data arrives and resolves after the output stream finishes. The visible implementation has several behaviors maintainers should review:
+
+- Certificate validation is explicitly disabled on its HTTPS requests.
+- Redirect handling is limited to the first redirect response; nested redirect responses are not handled as a complete redirect chain.
+- The output stream is closed when the first request receives a redirect, yet the redirected request is passed into a handler that writes to the same stream object. That is a likely failure path for redirects and should be tested before relying on redirected URLs.
+- The downloader accepts a URL supplied to the operation, so the caller and main-process boundary should restrict it to the expected trusted host(s).
+- The code reports the response content length for the completed result; that value can be zero or missing when the server does not provide the header, and it is not a cryptographic integrity check.
+- The downloaded file is written to its final environment-specific filename, rather than being described as a verified temporary artifact promoted after integrity validation.
+
+These are maintenance concerns to investigate. Client files should only be accepted after certificate verification, redirect checks, response-length checks where applicable, and a trusted checksum or signature verification. A failed or untrusted download must not silently replace a previously valid client file.
+
+### Content-update resume behavior
+
+The content-update worker checks whether a target file already exists and records its size as a potential partial-download offset. When the size is between zero and the expected size, it requests a byte range and appends received chunks to the existing file. The response handling accepts HTTP 200 or 206. If a server ignores a range request and returns the complete file with HTTP 200, appending that response to a partial file can produce a corrupted result.
+
+A reliable resumable downloader should inspect the response status and range headers, confirm that the returned range starts at the requested byte offset, and restart from zero if the server does not support the requested range. It should also verify the final size and digest before reporting completion. These checks are especially important after interruptions or when a CDN changes behavior.
+
+The existing content updater retries failed operations and records file progress, which is useful infrastructure. However, retry behavior should not substitute for strict response validation or final-file verification.
+
+### Manifest file names and filesystem containment
+
+The content updater constructs a local destination by joining the chosen build path, the Fortnite content directory, and the manifest's change name. In the visible function, that path is then used for file-existence checks, hash comparisons, deletion, or file download. The function does not show an explicit check that the resolved target remains below the intended PAK directory.
+
+The correct security boundary is the resolved destination, not simply the fact that a string was concatenated with a known directory. Before any file operation, an updater should normalize the target and verify that it remains inside the expected root. It should reject absolute names, path separators or parent-directory traversal that are not part of the documented manifest format, and conflicting entries. Deletion instructions require the same checks as downloads.
+
+Use only manifests from a trusted source. This README does not include a malicious manifest example or instructions to exploit this risk; the finding is included so maintainers can fix the validation gap and write a regression test.
+
+### Manifest retry policy and observability
+
+The manifest helper is configured for ten retries in addition to the initial request, meaning a failure can result in as many as eleven attempts. It applies request timeouts to headers and response body, logs failed attempts, and uses a capped increasing delay between attempts. This can help with temporary service errors, but it can also make a permanent failure take a noticeable amount of time before the UI receives a final result.
+
+The function logs the manifest URL. If a URL ever contains a signed query parameter or other secret, that value could be copied into logs or remote diagnostics. Prefer logging the host and a sanitized path, with sensitive query parameters removed. The renderer should display that the updater is retrying and provide a cancellation path for long operations.
+
+Retries should be differentiated by failure class. Invalid JSON, an unsupported schema, or an unsafe path should fail validation rather than being retried as though it were a transient network outage.
+
+### Hash semantics differ across subsystems
+
+The profiler exposes more than one type of digest. One value is computed from the filename and file size, another uses a limited region of the file plus name and size, and a separate operation computes MD5 over the full contents of the shipping executable. The disk-writing worker also uses MD5 to validate the bytes for a requested chunk.
+
+These values are not interchangeable. A digest of filename and size does not inspect file contents; a hash of a portion of a file is not a complete file digest; a per-chunk digest verifies only the requested chunk; and a whole-file digest covers a different input. A reference value can only be compared meaningfully with a digest generated from the same algorithm and input convention.
+
+For integrity-sensitive downloads, use a clearly documented full-file cryptographic digest or a trusted signature. If an existing server protocol requires a legacy fingerprint, label it accurately and do not present it as a security guarantee. Document the algorithm, exact bytes included, encoding, letter case, and expected value format for every hash field.
+
+## Disk writer worker: detailed behavior
+
+The checked-in `app/workers/diskWriterWorker.js` uses Node's worker-thread messaging API and synchronous filesystem calls. The worker maintains a map of open file descriptors, opens existing files for read/write, creates parent directories when necessary, and can prepare a target file to a declared size.
+
+### Message types visible in the worker
+
+| Message type | Visible behavior | Important note |
+| --- | --- | --- |
+| `allocate` | Prepares a file and sends a completion message | The allocation helper catches errors internally, so a later completion message is not proof of successful allocation |
+| `write` | Writes a supplied byte buffer at a specified offset | The returned `verified` field is set as part of the write path without a byte-level verification in that branch |
+| `verify` | Reads the requested region and compares an MD5 digest with an expected digest | Verifies a region, not automatically the entire file |
+| `shutdown` | Attempts to synchronize and close open file descriptors | Shutdown should be tested while writes are pending |
+
+The worker sends a `ready` message after initializing its listener. For writes, it checks that the requested operation has a task object and verifies that the synchronous write reports the expected number of bytes written. Errors are logged and, when a task is available, an error response is returned with file and chunk indices.
+
+### File allocation and existing files
+
+The allocation helper checks whether a destination already exists. If the existing file size matches the requested size, it returns without recreating it. If a non-empty file has a different size, it opens the file for read/write and returns rather than always truncating it. Otherwise it creates or truncates the target and attempts to set its size.
+
+This behavior can be useful in a chunked/resumable downloader, but the caller must know whether the existing bytes are valid. Matching size is not proof of matching content, and a non-empty partial file should not be treated as complete without verification. The allocation helper logs failures instead of propagating every error to the message handler, which makes a separate, explicit result contract particularly important.
+
+### Chunk writes and synchronization
+
+The worker writes data at the byte offset supplied with each task, allowing different chunks of a file to be placed in their intended positions. It records write activity and synchronizes open descriptors based on a batch count or elapsed time. On shutdown, it tries to force synchronization before closing its open descriptors.
+
+Synchronous filesystem methods make the worker's control flow easier to follow, but they still occupy the worker thread while each operation runs. The worker should not be given unbounded numbers of tiny tasks, and callers should wait for completion messages before scheduling conflicting work for the same file. An incomplete write or failed sync should be surfaced as an operation failure rather than only appearing in console logs.
+
+### Chunk verification
+
+The verification method reads a region defined by an offset and size, confirms that the requested number of bytes were read, calculates an MD5 digest for those bytes, and compares it with the supplied expected digest. A false result indicates the region did not match or could not be read. A true result proves only that this particular region matched the expected digest at the time of the check.
+
+MD5 is used here as a compatibility checksum, not a modern authenticity mechanism. The expected digest must itself come from a trustworthy source. The parent process should distinguish allocation completion, write completion, and verified completion rather than presenting all three as the same state.
+
+### Worker shutdown and resource cleanup
+
+Open file descriptors consume operating-system resources. The worker's shutdown path attempts to synchronize and close descriptors, and a periodic timer also invokes synchronization logic. Test this shutdown path with multiple open files, with files that are not writable, and after a write error. A worker should stop accepting new work after shutdown begins, flush or explicitly abandon queued work according to policy, close every descriptor, and notify the parent process when cleanup has completed.
+
+If the parent process loses a worker unexpectedly, it should not assume in-flight chunks completed. A recovery process should compare the on-disk state with the manifest and re-verify any chunks whose completion state is uncertain.
+
+## User-data, cache, and file ownership
+
+Electron provides an application-specific user-data directory intended for persistent app data. This repository uses it for downloaded environment-specific client DLLs and a local Wrapped cache. That data should be treated separately from the game build folder and from temporary worker files.
+
+### Suggested ownership boundaries
+
+| Data category | Recommended handling |
+| --- | --- |
+| Application settings | Store only settings that are necessary and safe to persist |
+| Wrapped report cache | Treat as disposable cached data and validate the JSON schema when reading |
+| Client DLLs | Store only trusted, verified files; do not trust the filename alone |
+| Build downloads | Keep under an explicitly chosen build root and verify before marking complete |
+| Temporary files | Name and track them clearly, then remove or recover them after interruption |
+| Logs | Redact authorization codes, tokens, sensitive URLs, and unnecessary personal paths |
+| Native modules | Package only expected, reviewed binaries matched to the target platform and runtime |
+
+The application should avoid mixing credentials with cached reports or build metadata. When adding a feature that persists data, describe its location, retention policy, format, migration behavior, and whether a reset or cleanup action is safe.
+
+## IPC/API catalogue for maintainers
+
+The following catalogue is based on names in `app/preload.js`. It should be used as a quick navigation aid. The main process may impose additional behavior, and the existence of an exposed method does not guarantee a successful operation.
+
+| Exposed method | Channel or mechanism | Data or result pattern |
+| --- | --- | --- |
+| `getVersion()` | Synchronous `app/version` | Returns the app version through the main process |
+| `maximize()` | `app/maximize` | Requests maximize/unmaximize |
+| `minimize()` | `app/minimize` | Requests minimization |
+| `close()` | `app/close` | Requests app shutdown |
+| `openBrowser(url)` | `open:browser` | Asks the OS to open a URL; validate schemes at the main boundary |
+| `authV3Callback(fn)` | `auth:callback` event | Registers a callback listener; code values are sensitive |
+| `openDirectory()` | `library:open-directory` | Opens a directory picker |
+| `shippingHash(path)` | `library:get-hash` | Requests a hash for the shipping executable |
+| `openPath(path)` | `library:open-path` | Asks the OS to open a path |
+| `openLogs()` | `library:open-logs` | Opens the app's user-data/log location |
+| `selectDownloadPath()` | `download:select-path` | Resolves with a selected folder or cancellation result |
+| `startDownload(payload)` | `download:start` | Sends a build download request |
+| `cancelDownload()` | `download:cancel` | Requests cancellation |
+| `onDownloadProgress(fn)` | `download:progress` event | Registers a progress listener |
+| `checkVCRedist()` | `vcredist:check` | Resolves to the main-process runtime-check result |
+| `cacheWrappedReport(id, data)` | `wrapped:cache-report` | Stores report JSON and returns a success flag |
+| `getCachedWrappedReport(id)` | `wrapped:get-cached-report` | Returns parsed report data or a missing/error result |
+| `cacheWrappedAccolades(data)` | `wrapped:cache-accolades` | Stores accolades data |
+| `getCachedWrappedAccolades()` | `wrapped:get-cached-accolades` | Returns parsed data or a missing/error result |
+| `sentrySetUser(...)` | `sentry:set-user` | Updates diagnostic context; consider privacy implications |
+| `sentryClearUser()` | `sentry:clear-user` | Clears diagnostic user context |
+| `launch(...)` | `launcher:launch` | Sends build path, token, environment, credentials, and build metadata |
+| `onLaunched(fn)` | `launcher:launch:result` event | Receives the launch-related notification |
+| `onGameClose(fn)` | `game:close` event | Receives the process-close notification |
+| `analyzePaks(path, id)` | `profiler:analyze` | Requests build-file analysis |
+| `onAnalyzeResult(fn)` | `profiler:analyze:result` event | Receives analysis rows |
+| `clientFingerprint(env)` | `client:fingerprint` | Returns a digest or a missing/error marker |
+| `disablePaks(path, files)` | `paks:disable` | Currently reaches a stub that logs the file list |
+| `discord(data)` | `discord:presence` | Sends an activity payload to the RPC handler |
+| `checkForContentUpdate(url, path, id)` | `content-update:check` | Requests manifest processing and returns the handler result |
+| `onContentUpdateProgress(fn)` | `content-update:progress` event | Registers a listener and returns an unsubscribe function |
+| `forceQuitGame()` | `launcher:force-quit` | Requests termination of the tracked game process |
+| `downloadClient(url, env)` | `download:client` invoke | Requests an environment-specific client download |
+| `onClientDownloadProgress(fn)` | `download:client:progress` event | Receives download percentage updates |
+| `invoke(channel, ...args)` | Generic invoke | Calls a main-process handler by channel name |
+| `send(channel, ...args)` | Generic send | Sends an IPC message by channel name |
+| `on(channel, fn)` | Generic event subscription | Registers a listener and returns an unsubscribe function |
+
+### Suggested API contract improvements
+
+- Return structured data consistently instead of mixing event-only results, booleans, `null`, and rejected promises without a documented convention.
+- Include a stable operation identifier for long-running work so progress and completion events can be associated with the correct request.
+- Add an unsubscribe function to every event-listener helper.
+- Redact authorization codes and sensitive URLs from diagnostic output.
+- Validate and constrain every URL and filesystem path in the main process.
+- Replace generic IPC access with narrow, documented methods where possible.
+- Separate "request accepted" from "operation completed" and from "operation verified."
+- Ensure error payloads are safe to display and do not reveal tokens, local secrets, or raw sensitive server responses.
+
+## Static audit methodology and limits
+
+This review was performed by reading the committed file tree, package metadata, preload bridge, and relevant sections of the bundled main-process and worker files. Because `app/index.js` and the download workers include bundled dependency code, not every line belongs to the application's own business logic. A string or library implementation appearing in a bundle is not necessarily an application feature; it can be part of a dependency.
+
+The audit did not execute the application, contact its services, download client binaries, run the native addon, launch Fortnite, or test the manifest updater against real data. Therefore, it cannot establish production availability, validate service-side behavior, or certify the safety of the compiled binaries.
+
+A follow-up dynamic test plan should use a disposable user-data directory, small synthetic files, mocked network responses, invalid test manifests, and a dedicated environment. Never use real account tokens in fixtures. Do not test anti-cheat-altering behavior against public services. The most valuable tests are those that prove failures are reported honestly and cannot corrupt unrelated files.
+
+### Findings that deserve priority
+
+1. Correct the client downloader's TLS verification and redirect handling before trusting downloaded DLLs.
+2. Stop logging raw authentication callback codes.
+3. Validate URL schemes before opening external links.
+4. Validate manifest filenames after path resolution and confine operations to the build's intended content directory.
+5. Verify HTTP range responses before appending to partial files.
+6. Make allocation/write/verification results unambiguous in the disk-writer protocol.
+7. Ensure launch notifications distinguish a missing native dependency from an actual successful operation.
+8. Deduplicate process terminal events so one process does not produce multiple final close notifications.
+9. Avoid placing token-like secrets in command-line arguments and remove embedded static credentials/configuration from the source.
+10. Make development and packaging procedures reproducible and platform-specific.
+
+These priorities concern correctness, integrity, privacy, and transparent user feedback. They should be addressed before adding more visual polish or increasing the number of features advertised in the interface.
 
 
 ## Final notes
