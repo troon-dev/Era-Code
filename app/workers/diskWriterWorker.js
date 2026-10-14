@@ -187,13 +187,14 @@ if (import_worker_threads.parentPort) {
           task.offset,
           task.expectedSize
         );
-        let verified = true;
         if (import_worker_threads.parentPort) {
           import_worker_threads.parentPort.postMessage({
             type: "completed",
+            operation: "write",
             fileIndex: task.fileIndex,
             chunkIndex: task.chunkIndex,
-            verified
+            written: true,
+            verified: false
           });
         }
       } else if (message.type === "verify") {
