@@ -35,6 +35,7 @@ This document is intentionally detailed. It explains the purpose of each major s
 - [Understanding configuration and runtime paths](#understanding-configuration-and-runtime-paths)
 - [Troubleshooting](#troubleshooting)
 - [Security, privacy, and safe testing](#security-privacy-and-safe-testing)
+- [Security audit summary (static review)](#security-audit-summary-static-review)
 - [Known limitations and implementation status](#known-limitations-and-implementation-status)
 - [Recommended development roadmap](#recommended-development-roadmap)
 - [Contributing](#contributing)
@@ -84,6 +85,35 @@ This document is intentionally detailed. It explains the purpose of each major s
 | Primary limitation | The repository mostly contains bundled output rather than the original source tree |
 
 The name of the repository is not, by itself, a reliable description of every component. This README describes the application based on the files and implementation that are checked in. It does not certify that the app or any included binary is safe, official, or compatible with a particular service.
+
+## Security audit summary (static review)
+
+**Review date:** 2026-10-26  
+**Scope:** Static inspection of the checked-in README, `app/preload.js`, `app/workers/diskWriterWorker.js`, package metadata, and documented findings for the bundled main process. This is not a runtime penetration test, dependency-vulnerability scan, or full native-binary analysis.
+
+The following findings are prioritized by practical risk. Severity labels are qualitative and are not CVSS scores.
+
+| Priority | Finding | Evidence and impact | Recommended remediation |
+| --- | --- | --- | --- |
+| **High** | HTTPS certificate verification is disabled in the client DLL download path | The current implementation is documented as disabling TLS certificate validation. A network attacker or intercepted connection could potentially substitute downloaded content. | Restore normal TLS certificate validation; require HTTPS; restrict allowed hosts and redirects; verify the downloaded artifact against a trusted SHA-256 digest or signature before use. |
+| **Medium / high-risk attack surface** | Generic IPC forwarding in the preload bridge | `app/preload.js` exposes `invoke(channel, ...args)`, `send(channel, ...args)`, and `on(channel, callback)`, allowing renderer code to supply channel names instead of calling only a fixed set of narrow methods. Exploitability depends on renderer trust and the main-process handlers, but this unnecessarily broadens the IPC surface. | Replace generic forwarding with an explicit allowlist of required channels; validate the sender and every payload in the main process; keep privileged filesystem, process, and network operations narrowly scoped. |
+| **Medium** | Disk worker can report allocation as verified after an allocation error | In `app/workers/diskWriterWorker.js`, `allocateFile()` catches errors without propagating failure, while the message handler subsequently emits `completed` with `verified: true`. The write branch also sets `verified: true` without running the digest check in that branch. This can make a failed or not-yet-verified operation look successful. | Propagate allocation failures; distinguish `written` from `verified`; only report integrity verification after the relevant digest check succeeds, and require full-file verification before declaring a download complete. |
+| **High-priority review item; exploitability not confirmed here** | Manifest-controlled filesystem changes | The content updater processes remote manifest instructions that can add, overwrite, or delete local files. A path-validation flaw could allow writes or deletions outside the intended build directory. This review does not claim a path-traversal exploit has been demonstrated. | Canonicalize each target path and prove it remains inside the selected build root before every read, write, or deletion. Reject absolute paths, traversal segments, unexpected path forms, and unsafe symlink targets; test with adversarial manifests in a disposable directory. |
+| **Medium / informational** | MD5 is used for chunk checksums | The disk writer calculates MD5 for chunk verification. A checksum is only as trustworthy as its expected value, and MD5 should not be used as a modern authenticity mechanism. | Use a trusted SHA-256 digest or digital signature for artifact integrity/authenticity. If a legacy protocol requires MD5, document that limitation and do not treat it as proof of trusted origin. |
+| **Supply-chain risk** | Bundled native and executable files are opaque to source review | `app/build/Release/dll_injector.node` and `app/binaries/FortniteLauncher.exe` are compiled binaries; their behavior and origin cannot be established from the readable JavaScript alone. | Record provenance and build instructions, verify publisher signatures where available, publish trusted hashes, and review/rebuild from trusted source before distribution. |
+| **Privacy risk to verify** | URLs and diagnostic context may contain sensitive values | Manifest URLs and diagnostic context can reveal signed query parameters, local paths, account identifiers, or authentication material if logged or sent to telemetry. The impact depends on the actual value and what is collected. | Redact tokens, authorization codes, signed query parameters, and unnecessary personal paths before logging or sending telemetry. Rotate any real credential that was exposed. |
+
+### Immediate remediation order
+
+1. **Fix TLS certificate validation** in the client downloader and add tests for invalid certificates and redirects.
+2. **Narrow the IPC bridge** to explicitly named methods and validate all inputs at the main-process boundary.
+3. **Correct the download worker's result contract** so allocation, writing, chunk verification, and full-file verification are separate states.
+4. **Prove filesystem confinement** for manifest-driven updates and exercise path-traversal cases against a disposable fixture.
+5. **Document binary provenance and telemetry redaction** before distributing a release.
+
+### Important limitations
+
+These findings describe observable code patterns and security-sensitive areas, not proof that the application has been exploited. The manifest-path item and privacy risks require end-to-end verification before being called confirmed vulnerabilities. No specific CVE is asserted because the checked-in package metadata alone is not a complete resolved dependency inventory. The bundled main process, renderer bundle, native addon, and helper executable still warrant independent review and runtime tests.
 
 ## Project goals and scope
 
