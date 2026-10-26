@@ -36,6 +36,7 @@ This document is intentionally detailed. It explains the purpose of each major s
 - [Troubleshooting](#troubleshooting)
 - [Security, privacy, and safe testing](#security-privacy-and-safe-testing)
 - [Security audit summary (static review)](#security-audit-summary-static-review)
+- [Deep-dive security review: evidence, impact, and remediation](#deep-dive-security-review-evidence-impact-and-remediation)
 - [Known limitations and implementation status](#known-limitations-and-implementation-status)
 - [Recommended development roadmap](#recommended-development-roadmap)
 - [Contributing](#contributing)
@@ -114,6 +115,42 @@ The following findings are prioritized by practical risk. Severity labels are qu
 ### Important limitations
 
 These findings describe observable code patterns and security-sensitive areas, not proof that the application has been exploited. The manifest-path item and privacy risks require end-to-end verification before being called confirmed vulnerabilities. No specific CVE is asserted because the checked-in package metadata alone is not a complete resolved dependency inventory. The bundled main process, renderer bundle, native addon, and helper executable still warrant independent review and runtime tests.
+
+## Deep-dive security review: evidence, impact, and remediation
+
+**Review date:** 2026-10-26  
+**Scope:** Static review of the checked-in bundled main process (`app/index.js`), preload bridge (`app/preload.js`), disk writer worker, and `package.json`. No live exploit was run. This is not a penetration test, a full dependency scan, or a native-binary audit.
+
+### Findings
+
+| Priority | Finding | Evidence and impact | Remediation |
+| --- | --- | --- | --- |
+| **Critical design risk** | Electron renderer has Node integration and weakened web protections | The BrowserWindow configuration sets `nodeIntegration: true`, `webSecurity: false`, and `allowRunningInsecureContent: true`. If untrusted or compromised renderer content executes, the impact can extend to local-process and filesystem capabilities. | Set `nodeIntegration: false`, `contextIsolation: true`, `sandbox: true`, and `webSecurity: true`; remove insecure-content allowances. Restrict navigation and new-window creation to an explicit allowlist. |
+| **High** | TLS certificate validation disabled for downloads | Download request paths use `rejectUnauthorized: false`, weakening verification of the remote server's identity and enabling interception/substitution risk. | Restore certificate verification, require HTTPS, restrict redirects and allowed hosts, and authenticate manifests/artifacts with a trusted signature or independently trusted SHA-256 digest. A checksum delivered by the same unauthenticated response is insufficient. |
+| **High** | Authentication callback data is logged | The deep-link callback logs the authorization code and callback URL. These may contain short-lived credentials or other sensitive query parameters. | Never log raw callback URLs or codes. Validate scheme, host, path, and state; redact sensitive query parameters; review and purge exposed logs and revoke/rotate any live credentials found there. |
+| **High** | Token passed in process command-line arguments | Launch construction includes a value derived from a token in an `AUTH_PASSWORD` argument. Depending on OS and permissions, process arguments may be visible to local diagnostics, other processes, crash reports, or support bundles. | Prefer a protected supported credential channel, reduce token lifetime/scope, and redact launch arguments from logs and crash/support reports. |
+| **High; exploitability unconfirmed** | Manifest-driven filesystem operations may escape the intended build directory | Update logic combines a destination directory with names supplied by a remote manifest before performing file operations. Without canonical containment and symlink checks, traversal-style names may target unintended files. | Canonicalize root and target paths, enforce path-boundary-aware containment before every read/write/delete, reject absolute paths and traversal segments, and prevent symlink escapes. Test only in a disposable fixture. |
+| **Medium** | Generic IPC forwarding | The preload bridge exposes generic `invoke`, `send`, and event subscription methods that accept renderer-supplied channel names. This broadens the privileged API and makes mistakes in main-process handlers more consequential. | Export narrowly scoped named methods; allowlist channels; validate payload type, size, and sender/origin in privileged handlers. |
+| **Medium** | Disk writer may report success without successful verification | Allocation errors can be caught without propagating failure, while a completion response can still report `verified: true`; a write result can also be marked verified before the corresponding digest comparison. | Fail closed, propagate allocation/write errors, and model allocation, write, chunk verification, and full-file verification as distinct states. Only set verified after a successful digest comparison. |
+| **Medium** | Resume-download logic may append a full response to a partial file | The updater supports range/resume behavior but accepts both HTTP 200 and 206 responses; if a server ignores a range request and returns the full file, appending it to an existing partial file can corrupt the result. | When resuming, require a valid 206 response and validate `Content-Range`; if a 200 response arrives, truncate/restart rather than append. Verify final size and digest. |
+| **Medium** | External URL handler lacks an evident scheme/host allowlist | A renderer-provided URL is forwarded to `shell.openExternal` without an obvious allowlist at that handler. Unsafe schemes can invoke unexpected local handlers on some systems. | Parse URLs and allow only required schemes (normally HTTPS) and known hosts; reject file, javascript, and other unneeded schemes. |
+| **Low / correctness** | Launch completion notifications can be duplicated or misleading | Both process `exit` and `close` handlers can call the same callback; missing native dependencies can also lead to a positive-looking injection callback. | Use an idempotent lifecycle state machine and structured result codes that distinguish process spawn, dependency missing, injection attempt, and actual exit. |
+| **Supply chain** | Native addon and helper executable are opaque to JavaScript review | The repository contains compiled `dll_injector.node` and `FortniteLauncher.exe`; their behavior and provenance cannot be established from JavaScript alone. | Publish provenance, hashes and signatures; audit/rebuild from trusted source where possible; scan and test packaged binaries in an isolated environment. |
+| **Dependency inventory gap** | Package ranges do not identify exact resolved dependencies | `package.json` uses semver ranges, and a root lockfile was not available in the reviewed repository snapshot. This prevents a reliable CVE-by-CVE assessment from the manifest alone. | Commit the release lockfile, record Electron/Node versions, and scan the resolved production and development dependency trees against current advisories. No specific CVE is asserted by this review. |
+
+### Prioritized verification plan
+
+1. **Electron hardening:** inspect effective runtime settings; disable Node integration; enable context isolation, sandboxing, and web security; block unexpected navigation and new windows.
+2. **TLS and artifact integrity:** use a test endpoint with an invalid certificate and verify that downloads fail; test redirects; verify trusted signatures/digests before using downloaded artifacts.
+3. **Filesystem confinement:** in a temporary directory, test `../`, absolute paths, alternate separators, encoded traversal, duplicate paths, and symlink escapes; confirm no operation changes files outside the fixture root.
+4. **Authentication hygiene:** use synthetic credentials, trigger a callback, then inspect logs, telemetry, crash reports, and process arguments for leaks.
+5. **IPC minimization:** inventory every registered channel and renderer caller; replace generic forwarding with explicit methods; test malformed payloads and unexpected senders.
+6. **Resume and disk-worker correctness:** simulate allocation/write failures, truncated responses, servers that ignore Range, and digest mismatches; never report success or verification on failure.
+7. **Supply chain:** scan the exact release lockfile, inspect native-module/runtime versions, verify binary signatures/hashes, and test a packaged release in a disposable VM.
+
+### Confidence and limitations
+
+The unsafe configuration and code patterns above are visible in the checked-in implementation. The real-world exploitability of renderer compromise, path traversal, and sensitive-data exposure depends on reachable inputs, runtime behavior, operating-system permissions, and external service responses. This review does **not** establish that remote code execution has been achieved, that a path traversal has been exploited, that users have been compromised, or that a particular CVE is present. Validate the findings with controlled tests before assigning CVSS scores or making public claims.
 
 ## Project goals and scope
 
