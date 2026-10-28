@@ -56,6 +56,7 @@ This document is intentionally detailed. It explains the purpose of each major s
 - [Authentication callback and sensitive-data handling](#authentication-callback-and-sensitive-data-handling)
 - [Application updater and release integrity](#application-updater-and-release-integrity)
 - [UI state and renderer integration](#ui-state-and-renderer-integration)
+- [Renderer interface: design, components, and interaction flow](#renderer-interface-design-components-and-interaction-flow)
 - [Privacy, telemetry, and support workflow](#privacy-telemetry-and-support-workflow)
 - [Suggested issue labels and triage categories](#suggested-issue-labels-and-triage-categories)
 - [Additional audit acceptance criteria](#additional-audit-acceptance-criteria)
@@ -1483,6 +1484,93 @@ The renderer receives progress and result events through the preload bridge. Bec
 
 If the current API has no way to query the state of an operation after a view is recreated, a future improvement is to expose a narrowly scoped status query rather than making the renderer infer state from old events.
 
+## Renderer interface: design, components, and interaction flow
+
+This section documents the visible renderer shell, the styling rules in the checked-in CSS bundle, and the operations exposed to interface code. It is a static description of the repository snapshot, not a claim that every view or interaction has been runtime-tested.
+
+### 1. How the interface is loaded
+
+The renderer entry point is `app/renderer/index.html`. It creates the `#root` element, sets the document to a dark theme, and loads two generated assets:
+
+- `app/renderer/assets/index-Cmjydc3O.js` — the compiled JavaScript application. The package manifest declares React and React DOM, alongside libraries for routing, state, data fetching, controls, animation, charts, Markdown, and 3D content.
+- `app/renderer/assets/index-ByT-tuHS.css` — the generated stylesheet that supplies layout utilities, colours, component styles, visual effects, animation rules, and responsive breakpoints.
+
+The React renderer mounts inside `#root`. The HTML shell does not contain the full interface itself; screen structure and event handlers live in the compiled JavaScript bundle. The hashed filenames are build outputs, so they should be updated together when the original renderer source is rebuilt.
+
+### 2. What the renderer CSS contains
+
+The CSS is more than a set of basic colours. It combines utility-style classes, shared theme tokens, custom visual effects, and component-specific styling.
+
+| CSS area | What is present in the checked-in stylesheet | Practical effect |
+| --- | --- | --- |
+| Dark base and theme variables | A near-black page background, light foreground text, card and border colours, plus `--primary`, `--accent`, and `--theme-*` variables | Gives the UI a consistent dark foundation and reusable accent colours |
+| Cyan, indigo, and purple accents | Theme values include cyan/blue, indigo, and violet/purple tones | Supports coloured highlights, gradient borders, and emphasis states |
+| Utility-based layout | Utility classes for flex and grid layouts, spacing, sizing, alignment, overflow, typography, borders, and rounded corners | Lets compiled components assemble layouts without a separate hand-written rule for every element |
+| Translucent panels | The `.glassmorphism` class uses a semi-transparent background, backdrop blur, and a subtle light border | Creates glass-like overlays and panels where components use the class |
+| Ambient backgrounds | `.blobs`, `.blob`, `.blob-rotate`, and `.blob-move`, with configurable size, blur, and colours | Provides the CSS building blocks for soft, blurred, moving colour fields |
+| Motion and progress effects | Keyframes/classes for aurora, meteors, gradients, grid movement, rainbow effects, shimmer, ripples, spinning, marquees, and progress bars | Supports animated decorative backgrounds, loading/progress treatments, and scrolling content |
+| Form and interaction states | Classes for hover, focus, active, disabled, pointer events, visibility, and transitions | Gives controls visual feedback and supports interaction-specific styling |
+| Markdown content | `.markdown` and `.markdown-v2` rules style headings, paragraphs, strong text, links, and lists | Helps formatted descriptions or report text fit the dark UI |
+| Special presentation styles | `.lanyard-wrapper` and `.wrapped__outline-text` define full-height centred presentation layout and outlined display text | Provides specialised styling for Lanyard/Wrapped-style presentation elements when those classes are used |
+| Responsive layout | Breakpoints at 640, 768, 1024, 1280, and 1536 pixels | Enables layout changes for different window widths and display sizes |
+| Motion preference | The stylesheet includes a `prefers-reduced-motion` media query | Allows motion-related CSS to account for the user's motion preference |
+
+The CSS defines these styles and animation primitives, but a selector's presence does not prove that a particular screen currently uses it. Confirm usage by tracing the class name in the renderer bundle or by testing the actual interface.
+
+### 3. Fonts and visual identity
+
+The HTML shell requests the Dancing Script font from Google Fonts, while the CSS defines a `.font-gaming` class using Bricolage Grotesque and also includes a Google Fonts import. The stylesheet's shared theme values include a dark background (`rgb(10 10 10)`), bright foreground text, cyan/blue primary accents, and violet/purple secondary accents.
+
+Since the fonts are requested externally, font availability can depend on network access and browser font loading. The interface should retain reasonable fallback fonts if those requests cannot complete.
+
+### 4. Interface operations exposed by the preload bridge
+
+The preload file exposes the same API under both `window.electron` and `window.electronAPI`. Those objects connect renderer controls to Electron's main process. The available method names show the following operation groups:
+
+| Operation group | Relevant exposed methods | Purpose |
+| --- | --- | --- |
+| Window and app controls | `getVersion`, `maximize`, `minimize`, `close`, `onToggleTitlebar` | Read the app version and request common window actions |
+| Browser and authentication callback | `openBrowser`, `authV3Callback` | Open a browser URL and receive an authentication callback event |
+| Local library and diagnostics | `openDirectory`, `handleOpenedDirectory`, `shippingHash`, `handleShippingHash`, `openPath`, `openLogs` | Select/open local folders, request a file hash, and open logs |
+| Build downloads | `selectDownloadPath`, `startDownload`, `cancelDownload`, `onDownloadProgress` | Select a destination, start or cancel a download, and receive progress events |
+| Game launch | `launch`, `onLaunched`, `onGameClose`, `forceQuitGame`, `checkVCRedist` | Request launch, receive launch/close events, force-quit a game process, and check the Visual C++ runtime |
+| Build profiling and client fingerprint | `analyzePaks`, `onAnalyzeResult`, `clientFingerprint`, `disablePaks` | Request a build analysis, receive its result, calculate a client fingerprint, and call the PAK-related operation |
+| Content and client downloads | `checkForContentUpdate`, `onContentUpdateProgress`, `downloadClient`, `onClientDownloadProgress` | Request content-update/client-download operations and receive progress |
+| Wrapped report cache | `cacheWrappedReport`, `getCachedWrappedReport`, `cacheWrappedAccolades`, `getCachedWrappedAccolades` | Save or retrieve report and accolade data from the local cache |
+| Integrations and diagnostics | `discord`, `sentrySetUser`, `sentryClearUser` | Send Discord presence data and set or clear diagnostic user context |
+
+These are API entry points, not proof that every button is visible or that every operation succeeds. For example, a method may be present in preload while the corresponding main-process operation remains incomplete, fails in a particular environment, or depends on valid service data. The existing implementation-status and troubleshooting sections describe those distinctions.
+
+### 5. How a UI action works from click to result
+
+The intended flow is:
+
+1. **A renderer component handles the interaction.** A click, selection, or other UI event invokes a method on `window.electron` or `window.electronAPI`.
+2. **The preload sends the request over Electron IPC.** The implementation uses `ipcRenderer.send` for event-style requests and `ipcRenderer.invoke` where a returned promise/result is expected.
+3. **The main process performs privileged work.** Depending on the channel, it can coordinate filesystem access, a network request, a download worker, a local process, or an integration.
+4. **Results return to the renderer.** Some operations return a value through `invoke`; others emit progress or result events such as `download:progress`, `launcher:launch:result`, `profiler:analyze:result`, or `content-update:progress`.
+5. **The UI updates its state.** A component can then update displayed progress, success, cancellation, or error information. The stylesheet controls how those states look; it does not execute the underlying operation.
+
+A request being sent is not equivalent to a successful download, verified file, or confirmed game launch. The interface should wait for the corresponding result event or return value and display failure states honestly.
+
+### 6. Renderer libraries declared by the project
+
+The current package manifest declares several libraries that provide common interface building blocks:
+
+- **React and React DOM** for the renderer UI; **React Router** for route-based navigation; **TanStack Query** for asynchronous data/query management; and **Zustand** for shared client state.
+- **Radix UI** and **React Icons** for controls and iconography; **Motion** for animation; **Recharts** for charts; and **react-markdown** for Markdown content.
+- **Three.js**, **React Three Fiber**, **Drei**, and **Rapier** for 3D rendering and physics-related components; **canvas-confetti** and **html2canvas** for visual effects or capture-related functionality.
+
+These are dependencies declared in `package.json`. Their presence indicates available implementation tools, but it does not by itself establish which screen imports each library or whether a feature using it is currently reachable.
+
+### 7. Safe ways to investigate or modify the interface
+
+- To understand a control, search the compiled renderer for its label or handler, identify the preload method it calls, and trace that method to the matching main-process IPC handler.
+- To understand an appearance, locate the CSS class in `index-ByT-tuHS.css` and then search for the same class in the renderer bundle. The stylesheet alone cannot explain the behaviour of a control.
+- Prefer recovering the original component and stylesheet source before making broad UI changes. Editing a generated/minified bundle directly is difficult to review and may be overwritten by the next build.
+- If a change adds/removes an exposed operation, update the preload/API documentation and verify the corresponding main-process handler, progress events, error path, and listener cleanup.
+- Test the packaged application at narrow and wide window sizes, with and without a network connection, and with reduced-motion preferences enabled. Do not infer runtime success from static CSS or a function name alone.
+
 ## Privacy, telemetry, and support workflow
 
 The codebase contains Sentry-related setup and can attach launch or build context to diagnostic events. Support tooling should avoid collecting more data than needed. Build paths can reveal operating-system usernames; build identifiers can be associated with user activity; authentication callbacks may contain credentials. Review every field attached to a telemetry event and explicitly scrub sensitive values.
@@ -1776,6 +1864,6 @@ Documentation should evolve with the source. When a function is implemented, tes
 
 ---
 
-**Repository:** [troon-dev/Era-Code-Malware](https://github.com/troon-dev/Era-Code-Malware)  
+**Repository:** [troon-dev/Era-Code](https://github.com/troon-dev/Era-Code)  
 **Main package entry point:** `app/index.js`  
 **Package version in this snapshot:** `3.0.9`
