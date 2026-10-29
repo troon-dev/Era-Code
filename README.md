@@ -57,6 +57,7 @@ This document is intentionally detailed. It explains the purpose of each major s
 - [Application updater and release integrity](#application-updater-and-release-integrity)
 - [UI state and renderer integration](#ui-state-and-renderer-integration)
 - [Renderer interface: design, components, and interaction flow](#renderer-interface-design-components-and-interaction-flow)
+- [Renderer JavaScript bundle deep dive](#renderer-javascript-bundle-deep-dive)
 - [Privacy, telemetry, and support workflow](#privacy-telemetry-and-support-workflow)
 - [Suggested issue labels and triage categories](#suggested-issue-labels-and-triage-categories)
 - [Additional audit acceptance criteria](#additional-audit-acceptance-criteria)
@@ -1571,6 +1572,110 @@ These are dependencies declared in `package.json`. Their presence indicates avai
 - If a change adds/removes an exposed operation, update the preload/API documentation and verify the corresponding main-process handler, progress events, error path, and listener cleanup.
 - Test the packaged application at narrow and wide window sizes, with and without a network connection, and with reduced-motion preferences enabled. Do not infer runtime success from static CSS or a function name alone.
 
+
+## Renderer JavaScript bundle deep dive
+
+**Scope and evidence note.** This is a static review of the user-supplied, formatted file named **app/renderer/assets/index-Cmjydc3O.js**. The supplied copy is 6,889,079 bytes and its Git blob SHA is **3281c50bf9fba381acd0a03fae3a206384390b27**; GitHub reports a different blob SHA (**cc5a497879e60f0c0c5158283d04584c31ae4d9d**) for the checked-in asset. The connector did not return the checked-in JavaScript body, so byte-for-byte parity could not be confirmed. The findings below are confirmed patterns in the supplied copy and should be checked against the exact release artifact before being treated as verified findings in that artifact. No app runtime, backend, native addon, or live OAuth flow was tested.
+
+The bundle contains the React runtime and the application renderer together. Much of its size comes from bundled libraries (React, router/query/state utilities, animation, charts, Three.js/React Three Fiber, physics, image/canvas helpers, and Sentry), not just Era's own UI. The production application code is distributed among the dependency code, so searching a single label or function is not a complete audit by itself.
+
+### Screens and navigation
+
+The router registers the following paths. Authentication and the account/role/maintenance gates run before the main application views.
+
+| Path | Functionality visible in the bundle |
+| --- | --- |
+| /auth | Discord sign-in flow, animated sign-in screen, and a four-item recent-news area. |
+| /home | Launcher dashboard with banner carousel, build launch/download actions, news, status alerts, and launcher activity/insights. |
+| /library | Local build library, installed-build metadata, import/identification flow, public/available builds, downloads, progress, and cancellation/error states. |
+| /store | Store catalog, owned products, monthly pack, and active perks. |
+| /shop | Fortnite item-shop view backed by the launcher API. |
+| /post/:id | Single news post and post-view tracking. |
+| /wrapped | Season recap/Wrapped status, accolades, report data, statistics, charts, and report presentation. |
+| /settings | Account information and username changes, installed builds/client settings, theme presets and custom colours. |
+| /profile | User statistics and recent match history. |
+| /leaderboards | Leaderboard results and placement display. |
+| / | Redirects to /home when authenticated, otherwise /auth. |
+
+The bundle also has dedicated states for maintenance, missing Visual C++ runtime, users without the required launcher role, mandatory username changes, launch verification failures, and fatal renderer errors. The visible strings include **Update Required**, **Auth Failed**, **Modified Files**, and **Launch Failed** for launch-flow errors. The presence of a route or state establishes that code is bundled, not that the server currently makes the feature available.
+
+### API and realtime data flow
+
+The renderer uses an authenticated Axios client for most account/build data and a separate public client for news. The authenticated client reads the persisted **era-auth-storage** entry from local storage and attaches its bearer token, plus the launcher version headers, to requests. A 401 response clears that stored authentication and redirects to /auth. A response indicating the missing-role error sets an access-denied state; other 403 responses set the maintenance state.
+
+| Service | Calls visible in the renderer | Purpose |
+| --- | --- | --- |
+| Public service at api-v1-public-service-prod.erafn.dev/api/v1/public | /news/posts, /news/posts/:id | List and display news. |
+| Launcher service at api-v1-launcher-service-prod.erafn.dev/api/launcher | /user, /banners/v2, /builds, /builds/query, /builds/public, /builds/identify, /status-alerts, /friends, /features, /shop, /cyclops/catalog, /cyclops/user, /insights, /user/stats, /user/matches, /leaderboards/:id?type=..., /user/wrapped, /user/wrapped/accolades, /user/wrapped/reports/:id, /check-username/:username, /user/username | Account, launcher dashboard, library, shop/store, status, profile, leaderboard and Wrapped data. |
+| OAuth service at oauth-v3-service-prod.erafn.dev/v3/oauth | /authorize, /token | Start the authorization-code flow and exchange the returned code for an access token. |
+| Phoenix WebSocket at wss://ws-prod.erafn.dev/launcher | Per-user ui, friends, activity, and invites channels; global ui:global; build-specific launcher channel | Push updates for account currency/character/role, shop data, match state, friend presence, activity/invites, feature flags and launch verification. |
+
+The status-alert query refreshes periodically, the insights store can poll every 15 seconds when started, and Wrapped status is polled every 10 seconds until the report is marked completed. These intervals are client code, not uptime guarantees for the backing service.
+
+### Authentication and persisted renderer state
+
+The sign-in button builds an authorization URL for the custom fluxapp://callback redirect, opens it through the Electron bridge, exchanges the callback code for a token, requests the user profile, and stores authentication through the persisted Zustand store. The bundle also updates Discord Rich Presence after login and on launch/close events.
+
+The renderer's OAuth request embeds a static HTTP Basic credential pair in the compiled JavaScript and creates state from a Base64-encoded object containing only the release version and channel. The visible request does not include a PKCE code_challenge, and the renderer callback handler does not visibly compare a returned state value before exchanging the code. Those observations require an end-to-end check of the main-process callback and authorization server; they are not proof that the service lacks additional validation. Any credential intended to be confidential must be treated as exposed when embedded in a distributed renderer. Prefer a public-client flow with PKCE or perform the confidential token exchange server-side, and use a cryptographically random, per-request state value that is validated on callback.
+
+Renderer storage includes at least **era-auth-storage** (authentication), **era-library-storage** (the local build list), **era-settings-storage** (including the client-DLL-check preference), **era-news-storage**, **era-status-alerts-storage**, and migration markers for older settings. The library metadata stored in local storage points to local build folders; the renderer's local state is not itself proof that a directory still exists or its contents are valid.
+
+One control labelled **Remember device** is rendered as a checkbox but has no visible state binding, onChange handler, or connection to the OAuth request in this bundle. It can visually toggle as a native checkbox, but this code does not make the choice persist or alter authentication behavior.
+
+### Build launch, integrity checks, and downloads
+
+The renderer's launch hook follows this sequence:
+
+1. Resolve build metadata and a local path from the library state or query the build service.
+2. Ask Electron to check for a content-update manifest at required-content-files.eracontentspace.site/manifests/:buildId.v1.manifest. Failure is caught and logged as a missing/optional manifest, after which the launch flow continues.
+3. Ask Electron for the local client fingerprint. In the production path, unless the persisted skip-check setting is enabled, the renderer calls the launcher service to check the client DLL and requests a download URL when the HTTP response is not successful. After a download it checks the fingerprint again.
+4. Ask Electron to analyse PAK files. The result is placed in renderer state and used in the launcher-channel verification.
+5. Join launcher:<buildId>, request a server timestamp, then send an integrity field built from release-version text, timestamp, shuffled analysis data, nested Base64 encoding, and reversed characters.
+6. On an “ok” verification response, request an online token and call Electron's launch method with the local path, token, production environment, and options. An offline path requests token:offline on the current channel.
+7. Receive launch/close events through the Electron bridge to update the UI and Discord Rich Presence.
+
+The Base64/reversal steps are encoding/obfuscation; they are not a digital signature or a substitute for server-side integrity validation. Actual trust depends on the service's verification rules and on the main/native process, which this renderer-only review cannot establish. The renderer also exposes the invalid-PAK disable-and-retry flow, but whether that operation safely changes files must be determined from the main-process implementation.
+
+Build downloads are initiated through the Electron bridge and observed through completion, cancellation, error, and per-file progress events. The UI translates common error text (permission denied, out of space, no network, timeout, 403/404 and TLS-related text) into human-readable messages. That mapping is UI error handling, not a guarantee that every error shape is recognized.
+
+### Realtime and update behavior
+
+The Phoenix connection is authenticated with the user's token and subscribes to account, global, friends, activity, invite and launch topics. On the global update event, however, the supplied renderer copy logs “Update notification received” and then only references window.electron.checkUpdates; it does not call the function or invoke the update-check channel in that callback. The separate startup updater path does invoke update:check, so this finding concerns the realtime push handler and does not prove that all update checks are broken.
+
+The launch hook registers an onAnalyzeResult callback inside each launch attempt but does not save or call a returned unsubscribe function. The auth screen likewise registers authV3Callback in a mount effect without returning cleanup. If the preload methods create persistent listeners, repeated navigation or launch attempts can leave old callbacks registered and cause the same result to be processed more than once. Verify the exact preload contract and test repeated launch/auth cycles; prefer one-shot subscriptions or explicit cleanup in finally/effect cleanup.
+
+### Telemetry and logging
+
+Sentry is initialized in production with application version context, 10% trace sampling, 10% session-replay sampling and 100% replay sampling on errors. Replay is configured with maskAllText and blockAllMedia, but sendDefaultPii is enabled. When authenticated, the renderer sets Sentry's user context to the account UUID, username and email and forwards the same identity to the Electron bridge. The renderer also sends user agent, language and application version as context. This is a real telemetry/data-minimisation decision and should be documented in the application's privacy notice and reviewed against retention/access settings in the Sentry project.
+
+The bundle logs detailed lifecycle events to the console. Noteworthy examples include the full returned client-DLL storage response/download URL and the refreshed user object. If a service response contains signed URLs, temporary credentials, account identifiers or other sensitive fields, logging the full object can put those values into diagnostic logs. Log only status and non-sensitive identifiers, redact query parameters and avoid printing complete user objects.
+
+### Findings and recommended fixes
+
+| Priority | Finding from the supplied renderer copy | Recommended action |
+| --- | --- | --- |
+| High-priority security review | Static Basic credential pair is embedded in the renderer; the authorization URL uses deterministic state and no visible PKCE fields/state comparison. | Confirm the server-side OAuth contract. Rotate the credential if it is meant to be secret; use PKCE, unpredictable per-request state and callback validation, or move confidential exchange out of the renderer. |
+| Medium — launch correctness | onAnalyzeResult subscription is registered per launch attempt without visible cleanup. | Store and call the unsubscribe handle, or provide a one-shot preload API. Add a regression test that launches, closes and launches again and confirms one verification/launch per analysis. |
+| Medium — library reliability | queryBuilds catches both HTTP 404 and 500 and calls clearBuilds(), which empties persisted local build metadata. A transient server failure can therefore hide every build from the library even though their folders remain on disk. | Keep the local list on transient/server errors. Remove a build only after an explicit, validated “not found” decision for that build; surface a retry/error state rather than clearing all entries. |
+| Medium — update correctness | The global WebSocket update handler references checkUpdates but does not invoke it. | Call the approved update-check method/channel, handle its rejection and test a server-pushed update notification. |
+| Medium — client update error handling | Any non-OK HTTP response from the client-DLL version check is treated as a reason to request/download the latest DLL, including possible authorization or server failures. | Distinguish “version missing/outdated” from 401/403/5xx/network errors; only download when the service response explicitly indicates an update is required. |
+| Medium — listener lifecycle | The auth callback subscription has no visible React-effect cleanup. Whether it leaks depends on the preload method's implementation. | Make the preload method return an unsubscribe function and return it from the component effect. |
+| Low — dead preference | Remember device has no handler, state, persistence or effect on the auth request in the supplied bundle. | Wire it to a supported backend/browser behavior or remove/disable the misleading control. |
+| Privacy — data minimisation | Sentry permits default PII, authenticated user UUID/username/email are explicitly attached, and error sessions have replay sampling configured to 100%. Console logs also print some full objects/URLs. | Review the exact captured payload and access/retention policy; retain masking, redact log values, minimise identity fields, and clearly disclose telemetry. |
+| Maintainability | The release string 3.0.9 is repeated in API headers, OAuth state, launch verification and update URLs rather than being consistently derived from the runtime version. | Use one generated release-version constant and test that package, renderer, server headers and update checks agree. |
+
+### Verification checklist
+
+- Compare the exact packaged JavaScript with the supplied formatted copy before attributing these findings to a release.
+- Test login from a clean state, verify the callback state, and inspect whether the OAuth flow uses PKCE or additional validation outside the renderer.
+- Launch, close and re-launch a build several times; confirm one PAK result, one verification exchange and one launch action per attempt.
+- Simulate a 500 from /builds/query; verify that local build metadata remains intact and errors are recoverable.
+- Deliver a global WebSocket update event and confirm that the updater is actually invoked.
+- Simulate client-version responses of 404, 401, 403 and 500; confirm only an explicit outdated/missing-version response triggers DLL download.
+- Inspect Sentry's actual captured event/replay payloads using synthetic account data; confirm that no tokens, full signed URLs or unnecessary user data are included.
+- Click Remember device, restart the app and sign in again; verify that the UI is either genuinely functional or clearly removed.
+
+Static code inspection can identify these wiring and data-handling patterns, but it cannot establish the authorization server's behavior, the main process's filesystem protections, the native addon's safety, or whether a remote service currently returns a particular response. Treat the OAuth points as high-priority validation items and the confirmed renderer wiring issues as fix candidates until runtime tests are recorded.
 ## Privacy, telemetry, and support workflow
 
 The codebase contains Sentry-related setup and can attach launch or build context to diagnostic events. Support tooling should avoid collecting more data than needed. Build paths can reveal operating-system usernames; build identifiers can be associated with user activity; authentication callbacks may contain credentials. Review every field attached to a telemetry event and explicitly scrub sensitive values.
