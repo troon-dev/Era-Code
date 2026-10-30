@@ -13,6 +13,7 @@ This document is intentionally detailed. It explains the purpose of each major s
 ## Contents
 
 - [Project at a glance](#project-at-a-glance)
+- [Quick start: using this repository snapshot](#quick-start-using-this-repository-snapshot)
 - [Project goals and scope](#project-goals-and-scope)
 - [Feature summary](#feature-summary)
 - [Launcher architecture](#launcher-architecture)
@@ -89,9 +90,32 @@ This document is intentionally detailed. It explains the purpose of each major s
 
 The name of the repository is not, by itself, a reliable description of every component. This README describes the application based on the files and implementation that are checked in. It does not certify that the app or any included binary is safe, official, or compatible with a particular service.
 
+## Quick start: using this repository snapshot
+
+This repository is useful for inspecting the launcher's checked-in implementation, renderer, worker files, and package metadata. It is not currently a turnkey installer or a reproducible development project: the package has no `scripts` section, no lockfile, and no declared Electron dependency, while the renderer and main process are checked-in build output.
+
+| If your goal is to... | Start here | What this checkout does not provide |
+| --- | --- | --- |
+| Read or inspect the project | Clone the repository and review `README.md`, `package.json`, `app/index.js`, `app/preload.js`, and `app/renderer/`. | A complete original TypeScript/React source tree or build configuration. |
+| Install JavaScript packages | Run `npm install` from the repository root. | An installed desktop launcher. This command only installs package dependencies. |
+| Open the desktop UI | Use the Electron version and renderer development server intended for this exact build. The main process selects `http://localhost:5173` in development mode. | A pinned Electron version, a `dev` script, or the Vite/server configuration needed to start that URL. |
+| Install the launcher for normal use | Use a release installer provided by the project maintainers, if available. | A checked-in installer or a documented packaging command in this snapshot. `FortniteLauncher.exe` is a helper binary, not an Era installer. |
+| Launch a local Fortnite build | Use a compatible Windows environment, the expected game executable under the selected build directory, valid runtime credentials, and the required client/native components. | A guarantee that game launching, DLL injection, remote verification, or any particular build works on this machine. |
+
+For a source checkout, the safe first checks are:
+
+```bash
+git status
+node --version
+npm --version
+npm run
+```
+
+`npm run` lists scripts and will report that none are configured in the current manifest. For a repository clone, use the command under [Getting the repository](#getting-the-repository). For more detail on dependencies, the development launch example, and platform assumptions, see [Installing dependencies](#installing-dependencies), [Running and inspecting the application](#running-and-inspecting-the-application), and [Requirements and platform compatibility](#requirements-and-platform-compatibility).
+
 ## Security audit summary (static review)
 
-**Review date:** 2026-10-26  
+**Review date:** 2026-10-30  
 **Scope:** Static inspection of the checked-in README, `app/preload.js`, `app/workers/diskWriterWorker.js`, package metadata, and documented findings for the bundled main process. This is not a runtime penetration test, dependency-vulnerability scan, or full native-binary analysis.
 
 The following findings are prioritized by practical risk. Severity labels are qualitative and are not CVSS scores.
@@ -108,10 +132,10 @@ The following findings are prioritized by practical risk. Severity labels are qu
 
 ### Immediate remediation order
 
-1. **Fix TLS certificate validation** in the client downloader and add tests for invalid certificates and redirects.
+1. **Fix TLS certificate validation** in client-DLL and build-manifest downloads; restrict hosts and redirects and verify artifacts before use.
 2. **Narrow the IPC bridge** to explicitly named methods and validate all inputs at the main-process boundary.
 3. **Correct the download worker's result contract** so allocation, writing, chunk verification, and full-file verification are separate states.
-4. **Prove filesystem confinement** for manifest-driven updates and exercise path-traversal cases against a disposable fixture.
+4. **Prove filesystem confinement** for content updates and build downloads; validate paths, manifest schemas, and resource limits before file operations.
 5. **Document binary provenance and telemetry redaction** before distributing a release.
 
 ### Important limitations
@@ -120,7 +144,7 @@ These findings describe observable code patterns and security-sensitive areas, n
 
 ## Deep-dive security review: evidence, impact, and remediation
 
-**Review date:** 2026-10-26  
+**Review date:** 2026-10-30  
 **Scope:** Static review of the checked-in bundled main process (`app/index.js`), preload bridge (`app/preload.js`), disk writer worker, and `package.json`. No live exploit was run. This is not a penetration test, a full dependency scan, or a native-binary audit.
 
 ### Findings
@@ -132,6 +156,7 @@ These findings describe observable code patterns and security-sensitive areas, n
 | **High** | Authentication callback data is logged | The deep-link callback logs the authorization code and callback URL. These may contain short-lived credentials or other sensitive query parameters. | Never log raw callback URLs or codes. Validate scheme, host, path, and state; redact sensitive query parameters; review and purge exposed logs and revoke/rotate any live credentials found there. |
 | **High** | Token passed in process command-line arguments | Launch construction includes a value derived from a token in an `AUTH_PASSWORD` argument. Depending on OS and permissions, process arguments may be visible to local diagnostics, other processes, crash reports, or support bundles. | Prefer a protected supported credential channel, reduce token lifetime/scope, and redact launch arguments from logs and crash/support reports. |
 | **High; exploitability unconfirmed** | Manifest-driven filesystem operations may escape the intended build directory | Update logic combines a destination directory with names supplied by a remote manifest before performing file operations. Without canonical containment and symlink checks, traversal-style names may target unintended files. | Canonicalize root and target paths, enforce path-boundary-aware containment before every read/write/delete, reject absolute paths and traversal segments, and prevent symlink escapes. Test only in a disposable fixture. |
+| **High-priority review item; exploitability unconfirmed** | Build-download manifest can control output paths and sizes | `DownloadOrchestrator` fetches a renderer-supplied manifest URL with TLS certificate verification disabled, then joins manifest `file.pathName` values to the destination and uses declared sizes/chunks without visible schema, path-containment, or resource-limit validation. | Restore TLS verification; allowlist manifest hosts; validate schema, file names, sizes, chunk ranges and totals; enforce canonical destination containment; cap manifest size, file count, file size, and total download size. |
 | **Medium** | Generic IPC forwarding | The preload bridge exposes generic `invoke`, `send`, and event subscription methods that accept renderer-supplied channel names. This broadens the privileged API and makes mistakes in main-process handlers more consequential. | Export narrowly scoped named methods; allowlist channels; validate payload type, size, and sender/origin in privileged handlers. |
 | **Medium** | Disk writer may report success without successful verification | Allocation errors can be caught without propagating failure, while a completion response can still report `verified: true`; a write result can also be marked verified before the corresponding digest comparison. | Fail closed, propagate allocation/write errors, and model allocation, write, chunk verification, and full-file verification as distinct states. Only set verified after a successful digest comparison. |
 | **Medium** | Resume-download logic may append a full response to a partial file | The updater supports range/resume behavior but accepts both HTTP 200 and 206 responses; if a server ignores a range request and returns the full file, appending it to an existing partial file can corrupt the result. | When resuming, require a valid 206 response and validate `Content-Range`; if a 200 response arrives, truncate/restart rather than append. Verify final size and digest. |
@@ -139,6 +164,21 @@ These findings describe observable code patterns and security-sensitive areas, n
 | **Low / correctness** | Launch completion notifications can be duplicated or misleading | Both process `exit` and `close` handlers can call the same callback; missing native dependencies can also lead to a positive-looking injection callback. | Use an idempotent lifecycle state machine and structured result codes that distinguish process spawn, dependency missing, injection attempt, and actual exit. |
 | **Supply chain** | Native addon and helper executable are opaque to JavaScript review | The repository contains compiled `dll_injector.node` and `FortniteLauncher.exe`; their behavior and provenance cannot be established from JavaScript alone. | Publish provenance, hashes and signatures; audit/rebuild from trusted source where possible; scan and test packaged binaries in an isolated environment. |
 | **Dependency inventory gap** | Package ranges do not identify exact resolved dependencies | `package.json` uses semver ranges, and a root lockfile was not available in the reviewed repository snapshot. This prevents a reliable CVE-by-CVE assessment from the manifest alone. | Commit the release lockfile, record Electron/Node versions, and scan the resolved production and development dependency trees against current advisories. No specific CVE is asserted by this review. |
+
+### Potential attacker impact (static assessment)
+
+The following explains why the findings matter at a high level. It is not an exploit guide: no payloads, exploit code, or live attacks were attempted. The impact depends on the stated precondition, and static inspection alone does not prove that an attacker can reach that precondition.
+
+| Risk area | Evidence in this checkout | Potential impact if the precondition is met | Assessment and defensive action |
+| --- | --- | --- | --- |
+| Renderer compromise could reach privileged operations | `BrowserWindow` enables `nodeIntegration`, disables `webSecurity`, and permits insecure content; the preload also exposes generic IPC methods. | If untrusted script execution occurs in the renderer, the combination may expose local files, process capabilities, or privileged main-process operations. | **Critical design risk; no renderer injection was demonstrated.** Disable Node integration, restore web security, enable sandboxing, restrict navigation, and replace generic IPC with validated narrow methods. |
+| Untrusted URL passed to the system browser | `open:browser` forwards the renderer-supplied value directly to `shell.openExternal` without an evident scheme/host allowlist. | Depending on the operating system and registered handlers, an unexpected scheme could open a local handler or application. | **Reachable handler; exploitability depends on the input path and OS.** Parse and allow only intended HTTPS destinations; reject unexpected schemes and validate the IPC sender. |
+| Client DLL substitution | The client downloader accepts a URL supplied at runtime, disables TLS certificate verification for both the initial request and redirect, writes the result under user data, and the launch path later selects that DLL for injection. | If an attacker can influence the URL or intercept the request, untrusted code could be stored and then passed to the native injection path. | **Confirmed insecure transport configuration; attack-chain reachability was not tested.** Restore TLS verification, restrict hosts and redirects, verify a trusted signature/digest, and refuse to inject unverified files. |
+| Manifest-directed file changes | The content updater joins `change.name` to the selected build's PAK directory and uses it for file checks, deletion, and downloads without a visible canonical-path containment check. | A malicious or compromised manifest could potentially overwrite or delete files outside the intended content directory. | **High-priority path-validation issue; traversal impact not demonstrated.** Canonicalize root and target paths, enforce containment and reject symlink escapes before every operation. |
+| Build-download manifest and file writes | The main IPC handler accepts a download payload; `DownloadOrchestrator.fetchManifest()` disables TLS verification; manifest `file.pathName` values are joined to the destination and passed to file scanning, placeholder creation, allocation, and chunk writing without visible canonical containment checks. Declared sizes and file counts also feed disk and worker operations. | If an attacker can influence the payload or manifest response, they may be able to target files outside the selected build folder or cause excessive disk/memory use. The TLS setting increases exposure to manifest substitution on the network. | **Confirmed unsafe trust/validation pattern; arbitrary file-write or resource-exhaustion impact not dynamically demonstrated.** Use TLS verification, a host allowlist, strict manifest schema and size limits, canonical path checks before every filesystem operation, and a trusted signature for manifests/artifacts. |
+| Authentication callback confusion and credential exposure | The `fluxapp://` callback handler extracts `code` and sends it to the renderer without a visible scheme/host/path or state check; callback URLs/codes are logged. | A forged or replayed callback may interfere with login if the surrounding OAuth flow permits it, while logs may retain short-lived authorization material. | **Validation gap visible; exploitability depends on OAuth server and flow behavior.** Validate the complete callback and per-request random state, use PKCE where supported, and redact codes/URLs from logs. |
+
+These items should be reported as **security risks or unverified vulnerability candidates**, not as confirmed remote exploits. Confirming exploitability would require an authorized test build, controlled accounts, a disposable VM, mock services, and harmless test files. Do not probe public accounts, production services, other users' machines, or anti-cheat/game processes.
 
 ### Prioritized verification plan
 
@@ -421,7 +461,7 @@ This cache is a convenience for persistence and responsiveness. It should not be
 ## Repository structure
 
 ```text
-Era-Code-Malware/
+Era-Code/
 ├── README.md
 ├── package.json
 └── app/
@@ -528,9 +568,11 @@ Use service URLs and credentials provided by the intended project configuration.
 Clone the repository using Git:
 
 ```bash
-git clone https://github.com/troon-dev/Era-Code-Malware.git
-cd Era-Code-Malware
+git clone https://github.com/troon-dev/Era-Code.git
+cd Era-Code
 ```
+
+Repository: [github.com/troon-dev/Era-Code](https://github.com/troon-dev/Era-Code).
 
 If you already have a local checkout, inspect the branch and working tree before pulling changes:
 
@@ -544,19 +586,23 @@ When investigating a bug, record the commit you tested. Two copies of the same p
 
 ## Installing dependencies
 
-Install dependencies from the project root:
+### Install the project dependencies
+
+From the repository root, install the dependencies listed in `package.json`:
 
 ```bash
 npm install
 ```
 
-Then inspect the scripts declared by the current package:
+This installs the JavaScript packages only. It does **not** install a ready-to-use Era Launcher application: this checkout has no installer/release configuration, no lockfile, and no declared `electron` dependency or `start`/`dev`/`build` script. The checked-in `dll_injector.node` is a prebuilt native module and may not match the Electron runtime installed on your computer.
+
+Check which scripts are available in your checkout:
 
 ```bash
 npm run
 ```
 
-The checked-in `package.json` in this snapshot defines the package entry point and dependencies but does not declare a `start`, `dev`, `build`, or native-rebuild script. Do not assume a command exists because it is common in other Electron projects. Use the actual scripts supplied by the revision you have.
+There are currently no package scripts to install or launch the app. For an end-user installation, use a release installer supplied by the project maintainers, if one is available; this repository snapshot alone does not provide a documented installer. Do not treat `npm install` as an installer for Windows or as proof that the launcher is ready to use.
 
 If installation fails, preserve the complete error and check the installed Node.js and npm versions:
 
@@ -575,7 +621,19 @@ Never install an unknown binary from an untrusted download to silence a module-l
 
 ## Running and inspecting the application
 
-Because the current package has no declared launch script, start by inspecting the package metadata and entry file rather than guessing an npm command.
+### Run from a source checkout
+
+The application entry point is `app/index.js`, and it must run inside Electron rather than plain Node.js. The current `package.json` does not include Electron or define a launch script. If you have obtained the Electron runtime version intended for this exact build and installed it in the project environment, launch the entry point from the repository root with:
+
+```bash
+npx electron app/index.js
+```
+
+`npx` may offer to fetch Electron if it is not installed. Do not accept an arbitrary latest version for a release build: Electron versions affect native module compatibility, and the repository does not record the required Electron version. The command above is therefore a development launch example, not a guaranteed setup command for this snapshot. If Electron is not already available, ask the project maintainers for the matching runtime/version and original development setup.
+
+The current renderer HTML and bundled assets are present, but that alone does not ensure a successful launch. The application also depends on Electron lifecycle APIs, native-module compatibility, Windows-specific game paths for game launching, and external service availability. The included `FortniteLauncher.exe` is a helper binary, not a standalone installer for Era.
+
+For basic inspection before launching, use:
 
 Useful checks include:
 
@@ -593,7 +651,7 @@ node --check app/index.js
 
 Do not run `app/index.js` directly with plain Node as a substitute for Electron. The main process imports Electron APIs and expects the desktop runtime and application lifecycle to be in place.
 
-For runtime troubleshooting, use the intended Electron packaging/development setup for the exact revision. Since the original build scripts are absent from this package snapshot, obtaining the original source tree or packaging configuration may be necessary to reproduce the official development workflow.
+For runtime troubleshooting, use the intended Electron packaging/development setup for the exact revision. Since the original build scripts and pinned Electron version are absent from this package snapshot, obtaining the original source tree or packaging configuration may be necessary to reproduce the official development workflow.
 
 ## Build and packaging notes
 
@@ -1249,8 +1307,11 @@ The following catalogue is based on names in `app/preload.js`. It should be used
 | `close()` | `app/close` | Requests app shutdown |
 | `openBrowser(url)` | `open:browser` | Asks the OS to open a URL; validate schemes at the main boundary |
 | `authV3Callback(fn)` | `auth:callback` event | Registers a callback listener; code values are sensitive |
+| `onToggleTitlebar(fn)` | `toggle-titlebar` event | Receives whether the custom title bar should be shown after full-screen transitions |
 | `openDirectory()` | `library:open-directory` | Opens a directory picker |
+| `handleOpenedDirectory(fn)` | `library:directory-selected` event | Receives the selected directory path |
 | `shippingHash(path)` | `library:get-hash` | Requests a hash for the shipping executable |
+| `handleShippingHash(fn)` | `library:hash-result` event | Receives the hash result or `null` |
 | `openPath(path)` | `library:open-path` | Asks the OS to open a path |
 | `openLogs()` | `library:open-logs` | Opens the app's user-data/log location |
 | `selectDownloadPath()` | `download:select-path` | Resolves with a selected folder or cancellation result |
@@ -1280,6 +1341,33 @@ The following catalogue is based on names in `app/preload.js`. It should be used
 | `invoke(channel, ...args)` | Generic invoke | Calls a main-process handler by channel name |
 | `send(channel, ...args)` | Generic send | Sends an IPC message by channel name |
 | `on(channel, fn)` | Generic event subscription | Registers a listener and returns an unsubscribe function |
+
+`window.electron` and `window.electronAPI` are aliases for this same object. The table above lists the named preload methods. The main process also registers the following application-owned request channels; `send` channels are event-style requests, while `handle` channels return a promise result:
+
+| Main-process request channel | IPC style | Purpose / result |
+| --- | --- | --- |
+| `app/version` | `sendSync` | Returns the Electron app version synchronously. |
+| `app/minimize`, `app/maximize`, `app/close` | `send` | Control or close the main window/application. |
+| `open:browser` | `send` | Passes a URL to Electron's external browser handler. |
+| `library:open-directory`, `library:get-hash`, `library:open-path`, `library:open-logs` | `send` | Select a directory, hash the expected Fortnite shipping executable, open a path, or open the app user-data folder. |
+| `download:select-path` | `handle` | Opens a folder picker; returns the path or `null` if cancelled. |
+| `download:start`, `download:cancel` | `send` | Starts or cancels a build download. Results arrive through download events. |
+| `vcredist:check` | `handle` | Checks a Windows Visual C++ runtime registry entry; returns a boolean. |
+| `update:check` | `handle` | Requests an application update check and returns the updater result or an error. |
+| `update:install` | `send` | Asks `electron-updater` to install a downloaded update and restart. |
+| `launcher:launch`, `launcher:force-quit` | `send` | Starts the configured Fortnite executable with launch arguments/token or kills the tracked game process. |
+| `profiler:analyze` | `send` | Scans the build's PAK/plugin folders and emits analysis rows. |
+| `client:fingerprint`, `paks:disable` | `handle` | Returns the local client DLL digest, or calls the PAK-disable stub and returns a boolean. |
+| `content-update:check` | `handle` | Reads a manifest, updates PAK files, and returns `{ success: true }`, possibly with `noManifest: true`. |
+| `download:client` | `handle` | Downloads an environment-specific client DLL from the supplied URL and returns `true` or an error. |
+| `wrapped:cache-report`, `wrapped:get-cached-report`, `wrapped:cache-accolades`, `wrapped:get-cached-accolades` | `handle` | Writes/reads local Wrapped report and accolade JSON. |
+| `settings:import-v1` | `handle` | Reads and deletes the legacy `v1-settings.json` file if present; returns parsed settings or `null`. |
+| `discord:presence` | `send` | Updates the Discord RPC activity from the supplied presence object. |
+| `sentry:set-user`, `sentry:clear-user` | `send` | Set or clear the diagnostic user context. |
+
+Main-process events sent to the renderer include `toggle-titlebar`, `auth:callback`, `library:directory-selected`, `library:hash-result`, `download:progress`, `download:complete`, `download:canceled`, `download:error`, `download:client:progress`, `content-update:progress`, `launcher:launch:result`, `game:close`, and `profiler:analyze:result`. `electron-updater` additionally emits `update:checking`, `update:available`, `update:not-available`, `update:error`, `update:download-progress`, and `update:downloaded`. The SDK's internal Sentry IPC traffic is not part of the app's named product API.
+
+The bridge also exposes generic `invoke`, `send`, and `on` methods, so renderer code can address channels beyond the named wrappers. In the checked-in application, the updater uses this generic bridge for `update:check`, `update:install`, and updater events. This makes the channel list a privileged boundary: it must be reviewed together with all registered main-process handlers, not treated as a strict allowlist just because the table lists named methods.
 
 ### Suggested API contract improvements
 
@@ -1514,9 +1602,72 @@ The CSS is more than a set of basic colours. It combines utility-style classes, 
 | Markdown content | `.markdown` and `.markdown-v2` rules style headings, paragraphs, strong text, links, and lists | Helps formatted descriptions or report text fit the dark UI |
 | Special presentation styles | `.lanyard-wrapper` and `.wrapped__outline-text` define full-height centred presentation layout and outlined display text | Provides specialised styling for Lanyard/Wrapped-style presentation elements when those classes are used |
 | Responsive layout | Breakpoints at 640, 768, 1024, 1280, and 1536 pixels | Enables layout changes for different window widths and display sizes |
-| Motion preference | The stylesheet includes a `prefers-reduced-motion` media query | Allows motion-related CSS to account for the user's motion preference |
+| Motion preference | One shine animation is wrapped in `@media (prefers-reduced-motion: no-preference)` | Enables that effect when motion is allowed; the sheet does not provide a broad `prefers-reduced-motion: reduce` override |
 
 The CSS defines these styles and animation primitives, but a selector's presence does not prove that a particular screen currently uses it. Confirm usage by tracing the class name in the renderer bundle or by testing the actual interface.
+
+#### Additional styling capabilities in the compiled CSS
+
+The stylesheet also contains functional rules beyond its general dark theme and animation list:
+
+- **Shared design tokens:** `:root` defines the background and foreground, primary and secondary colours, card and border colours, five gradient colours, and variables for the size, blur, and colours of ambient blobs. Separate `--theme-primary`, `--theme-secondary`, and `--theme-accent` values let utility classes build theme-tinted text, borders, rings, and gradients.
+- **Electron window dragging:** `.drag` marks a region as an Electron draggable area and disables text selection there; `.no-drag` marks controls inside that region as clickable. These classes support the custom frameless title bar.
+- **Custom scrollbars:** WebKit scrollbar rules set an 8-pixel track/thumb, a transparent track, rounded indigo thumb, and a brighter hover state. This affects Chromium/Electron rendering; it is not a cross-browser scrollbar API.
+- **Control feedback and state styling:** There are hover, focus, focus-visible, active, disabled, `group-hover`, `group-open`, `peer-checked`, and `data-disabled` variants. They provide visual response for controls such as buttons, toggles, disclosure groups, and disabled actions when the renderer uses the corresponding classes. The CSS does not itself implement the control behavior.
+- **Layered visual effects:** Besides `.glassmorphism`, the sheet includes gradient borders/backgrounds, masked gradient layers, grid and radial backgrounds, blur and backdrop blur, neon shadows, text clipping/strokes, and line-clamp helpers. These can create glowing cards, decorative surfaces, compact text, and layered hero sections.
+- **Animated presentation primitives:** Keyframes and utility classes cover aurora, moving blobs, meteors, grid movement, shimmer/shine, rainbow gradients, ripples, marquees, progress bars, spinning, and pulsing. Some utilities accept custom CSS variables such as `--duration`, `--gap`, and blob colour/size values.
+- **Markdown content:** `.markdown` and `.markdown-v2` style paragraphs, heading hierarchy, links, nested ordered/unordered lists, list markers, blockquotes, horizontal rules, inline code, and preformatted code blocks. This is presentation support for rendered text, not a Markdown parser.
+- **Responsive layouts:** The generated utilities include container widths and responsive grid, spacing, sizing, and typography variants at 640, 768, 1024, 1280, and 1536 pixels. The presence of these breakpoints does not prove every screen adapts well at those widths; the main Electron window itself has a fixed minimum size.
+
+The CSS appears to be generated utility output with additional component styles. To determine which of these capabilities is used by the app, search the exact class in `index-Cmjydc3O.js`; to understand what a control does, also trace its renderer handler and preload IPC call. A class such as `.peer-checked` can draw a selected switch state, for example, but cannot save a setting or perform the action represented by that switch.
+
+#### Animation and visual-effect reference
+
+The compiled stylesheet defines the following reusable effects. Durations below are the defaults written in the CSS; a component can override timing or custom properties, and some helpers do not set a duration themselves.
+
+| CSS class / keyframe | Default behavior | Possible UI use |
+| --- | --- | --- |
+| `.blob`, `.blob-rotate`, `.blob-move` | Three blurred ellipses use separate colours, staggered delays, 8-second blob morphing, 20–30-second rotation, and 10-second movement. | Slow ambient colour fields behind a screen or card. |
+| `.animate-aurora` | Moves a background gradient back and forth over 10 seconds. | Animated banner or decorative surface. |
+| `.animate-grid` | Shifts a grid vertically over 15 seconds. | Moving grid background. |
+| `.animate-meteor` | Fades and translates a meteor-like element across 500 pixels over 5 seconds. | Decorative streaks or star-field effects. |
+| `.animate-gradient`, `.animate-rainbow` | Move a background gradient over 8 or 10 seconds respectively. | Gradient title, border, or highlight. |
+| `.animate-shiny-text`, `.animate-shimmer-slide` | Sweep a background shine; the slide variant uses a `--speed` variable. | Shimmering text, card edges, or loading decoration. |
+| `.animate-marquee`, `.animate-marquee-vertical` | Translate content by its width/height using `--duration` and `--gap`. | Repeating horizontal or vertical ticker content. |
+| `.animate-progress-bar` | Animates width from 0% to 100% with a linear, forwards animation; the class itself does not define a duration. | A CSS-driven progress fill when the component supplies suitable timing. |
+| `.animate-ripple`, `.animate-rippling` | Scale an element outward and fade it; the ripple helper repeats over 3.4 seconds, while rippling runs once over 0.6 seconds. | Decorative pulse/ripple indicator. |
+| `.animate-spin`, `.animate-spin-around`, `.animate-pulse`, `.animate-ping`, `.animate-blink-cursor` | Standard rotation, custom rotation sequence, opacity pulse, expanding ping, or blinking opacity with fixed timings from 1 to 2 seconds (spin-around uses `--speed`). | Loading indicators, notification emphasis, or cursor-like accents. |
+
+The source also defines `featured-display-bar`, shine, line-shadow, and background-position keyframes, including some duplicated generated keyframe blocks. Duplication is a build-output detail; it does not mean the effect runs automatically. An animation only appears when an element receives the corresponding class and the required dimensions, variables, content, and positioning.
+
+#### Layout, accessibility, and runtime boundaries
+
+- **Window chrome:** `.drag` and `.no-drag` are Electron-specific. A draggable region can make pointer events behave differently from a normal web page, so clickable title-bar buttons should sit in a `.no-drag` region.
+- **Keyboard and assistive-technology helpers:** `.focus-visible` variants draw rings or outlines for keyboard focus, and `.sr-only` visually hides content while keeping it available to assistive technology. The stylesheet provides these tools but cannot confirm that every interactive control has an accessible name or focus order.
+- **Direction-aware controls:** `rtl:` variants and logical inset utilities include support for right-to-left layouts, including a checked peer switch translation. This is partial styling support, not proof that every screen has been localized or tested in RTL.
+- **Container and overflow behavior:** The stylesheet includes responsive container widths, flex/grid helpers, aspect-ratio and overflow rules, and one-line/two-line clamping. A line-clamped label may be visually truncated; inspect the component for an accessible full-text alternative where needed.
+- **Browser/runtime assumptions:** The stylesheet is loaded by Electron's Chromium renderer and uses WebKit scrollbar selectors, `backdrop-filter`, masks, container query units, and newer CSS utility output. Effects can render differently in other browsers or older runtimes.
+- **Performance:** Large blurred surfaces, multiple infinite animations, backdrop filters, and repeated shadows can be GPU-intensive. Use browser devtools to check actual compositing and frame time before adding these effects to large or full-window layers.
+- **Motion accessibility:** Only the specific `.motion-safe` shine helper is gated by `prefers-reduced-motion: no-preference`. Many other animation classes are not globally disabled for users who request reduced motion, so the component must provide an appropriate fallback if required.
+
+For a reproducible CSS change, locate the original component/class source if available, make the edit there, rebuild the renderer, and update the hashed HTML references. Editing this generated file directly is useful for diagnosis but is likely to be lost on rebuild.
+
+#### CSS classes confirmed in the renderer bundle
+
+I also searched the checked-in JavaScript bundle for exact class names. These examples connect some CSS rules to concrete renderer elements:
+
+| Class found in both assets | Renderer use visible in the bundle | What the CSS contributes |
+| --- | --- | --- |
+| `blobs`, `blob-rotate`, `blob-move` | A decorative component renders three nested blob layers and marks the wrapper `role="presentation"` with pointer events disabled. | Positions, blurs, colours, rotates, and moves the background shapes without intercepting clicks. |
+| `lanyard-wrapper` | Wraps a React Three Fiber canvas and camera setup. | Centres the canvas in a full-viewport flex container. |
+| `wrapped__outline-text` | Styles a large season-name heading in the Wrapped presentation. | Makes the text transparent with a violet outline. |
+| `line-clamp-1`, `line-clamp-2` | Used on compact names/descriptions in card-like data and shop-related UI. | Restricts text to one or two lines to keep card heights consistent. |
+| `animate-progress-bar` | Applied to a 1-pixel-high progress strip with `animationDuration: "7s"`. | Fills the strip from 0% to 100% over the supplied seven-second duration. |
+| `animate-rainbow` and `before:animate-rainbow` | Used in a button variant and a blurred pseudo-element behind it. | Moves a multi-colour gradient through the button and its glow. |
+| `animate-spin` | Appears on several renderer elements. | Provides the standard one-second rotating loading/decorative effect. |
+| `markdown`, `markdown-v2` | Referenced by bundled rich-text rendering components. | Formats headings, links, lists, quotes, and code supplied as rendered Markdown. |
+
+Exact string search did not find `glassmorphism`, `font-gaming`, `.animate-aurora`, `.animate-grid`, `.animate-meteor`, `.animate-shimmer-slide`, `.animate-shiny-text`, or the marquee helpers in this renderer bundle. Their CSS rules are available, but they may be unused, constructed dynamically, or referenced by a different build; do not claim they appear in the active UI without further tracing. Conversely, a class string found in the bundle confirms a code reference, not necessarily that the associated component is reachable in every session.
 
 ### 3. Fonts and visual identity
 
@@ -1575,7 +1726,7 @@ These are dependencies declared in `package.json`. Their presence indicates avai
 
 ## Renderer JavaScript bundle deep dive
 
-**Scope and evidence note.** This is a static review of the user-supplied, formatted file named **app/renderer/assets/index-Cmjydc3O.js**. The supplied copy is 6,889,079 bytes and its Git blob SHA is **3281c50bf9fba381acd0a03fae3a206384390b27**; GitHub reports a different blob SHA (**cc5a497879e60f0c0c5158283d04584c31ae4d9d**) for the checked-in asset. The connector did not return the checked-in JavaScript body, so byte-for-byte parity could not be confirmed. The findings below are confirmed patterns in the supplied copy and should be checked against the exact release artifact before being treated as verified findings in that artifact. No app runtime, backend, native addon, or live OAuth flow was tested.
+**Scope and evidence note.** This is a static review of the renderer bundle present in this repository checkout at `app/renderer/assets/index-Cmjydc3O.js` (7,050,729 bytes), together with the checked-in renderer HTML and CSS. The hash-like filenames are generated build names. The review describes code and strings found in those local assets; it does not establish that the service endpoints are currently available or that every route was exercised. No app runtime, backend, native addon, or live OAuth flow was tested.
 
 The bundle contains the React runtime and the application renderer together. Much of its size comes from bundled libraries (React, router/query/state utilities, animation, charts, Three.js/React Three Fiber, physics, image/canvas helpers, and Sentry), not just Era's own UI. The production application code is distributed among the dependency code, so searching a single label or function is not a complete audit by itself.
 
@@ -1611,6 +1762,22 @@ The renderer uses an authenticated Axios client for most account/build data and 
 | Phoenix WebSocket at wss://ws-prod.erafn.dev/launcher | Per-user ui, friends, activity, and invites channels; global ui:global; build-specific launcher channel | Push updates for account currency/character/role, shop data, match state, friend presence, activity/invites, feature flags and launch verification. |
 
 The status-alert query refreshes periodically, the insights store can poll every 15 seconds when started, and Wrapped status is polled every 10 seconds until the report is marked completed. These intervals are client code, not uptime guarantees for the backing service.
+
+#### Other network-facing services and artifact endpoints
+
+The API table above covers the account-facing HTTP and Phoenix interfaces. The checked-in main and renderer bundles also contain these infrastructure calls. These are service integrations, not additional JSON endpoints exposed by a local launcher server:
+
+| Host / protocol | Observed use |
+| --- | --- |
+| `build-download-chunks-v3.eracontentspace.site` | Build manifest paths of the form `/manifests/v3.<build-uuid>.manifest` and chunk objects at `/chunks/<chunk-hash>.chunk`. The manifest supplies build files and chunk metadata to the download workers. |
+| `required-content-files.eracontentspace.site` | Content-update manifest at `/manifests/<build-id>.v1.manifest` and file downloads at `/files/<file-name>`. The content updater uses these paths for PAK changes. |
+| `launcher-v3-bucket.eracontentspace.site` (S3-compatible update feed) | `electron-updater` is configured with bucket `launchers-v3`, region `auto`, and channel `latest`. It checks/downloads launcher application releases. |
+| Sentry ingestion DSN in `app/index.js` | Sends configured error, diagnostic, and performance telemetry to the Sentry project. This is a write/ingestion endpoint rather than a user-facing data API. |
+| Discord RPC | The bundled Discord RPC client logs in with a configured application ID and receives presence updates from the renderer through `discord:presence`. It communicates with the local Discord client; the renderer does not call Discord's REST API directly for presence. |
+| Google Fonts | `fonts.googleapis.com` and `fonts.gstatic.com` are requested by the HTML/CSS for Dancing Script and Bricolage Grotesque fonts. |
+| Client DLL URL supplied at runtime | `download:client` accepts a URL and downloads from it into the app's user-data directory. The source does not pin one single client-file URL in the downloader; the renderer obtains the URL from service data. |
+
+HTTP methods and request bodies vary by call site and are not exhaustively encoded in the compact route list above. To audit a particular operation, search its path in the renderer bundle and inspect the nearby Axios call, query parameters, request body, response handling, and authentication headers. Do not infer a stable public API contract or guaranteed availability from a URL embedded in a client build.
 
 ### Authentication and persisted renderer state
 
@@ -1742,6 +1909,26 @@ This is the main application entry point and a large bundled file. Its visible a
 
 The main process is responsible for privileged work that the renderer cannot safely perform by itself: reading and writing local files, opening system dialogs, coordinating operating-system processes, invoking update functionality, and forwarding result events. A change in this file can therefore have consequences beyond the screen currently visible in the interface.
 
+#### What the main process does
+
+At startup, `app/index.js` requests a single-instance lock and registers the `fluxapp://` protocol used for authentication callbacks. In production it serves the checked-in renderer directory through `electron-serve`; in development it points the window at `http://localhost:5173`. Once Electron is ready, it sets diagnostic context, attempts to start `FortniteLauncher.exe` as a helper, logs in to Discord RPC, and creates the application window. The window is 1160 × 710 pixels, frameless, and non-resizable. Closing all windows quits the app outside macOS and attempts to stop the helper process.
+
+The main process also installs handlers for these groups of renderer requests:
+
+| Group | What the handlers do |
+| --- | --- |
+| Window and system integration | Minimize/maximize/close the window, return the app version, open external URLs and local folders, show directory pickers, open logs, and check the Windows Visual C++ runtime registry entry. |
+| Build library | Check for the expected Fortnite shipping executable and calculate its MD5 digest. |
+| Build downloads | Select a destination, start/cancel a manifest-based download through the worker/orchestrator code, and send progress/completion/error events to the renderer. |
+| Game launch | Construct the expected Windows game executable path, spawn it with launch arguments and a supplied token, try to inject an environment-specific DLL, and report launch/close events. |
+| Build analysis | Walk the PAK and plugin directories and return filename/size and partial SHA-256 fingerprints. The `paks:disable` handler currently calls a stub that only logs the request. |
+| Content updates | Fetch a manifest, compare or delete listed files under the build's PAK directory, download requested files, and forward progress. |
+| Client DLL | Download an environment-specific DLL into the app's user-data directory and calculate its local fingerprint. |
+| Wrapped cache and settings | Read/write Wrapped report and accolade JSON files under Electron's user-data directory, and import a legacy settings file if present. |
+| Integrations and diagnostics | Update Discord Rich Presence, attach/clear Sentry user context, record subsystem events, and check/download/install application updates from the configured update feed. |
+
+This is an overview of the code paths, not a claim that each workflow succeeds. Several implementation details deserve attention when running or distributing the app: the window sets `webSecurity: false` and `allowRunningInsecureContent: true`; the client DLL downloader disables HTTPS certificate verification; content-manifest paths are joined to the build directory without an explicit containment check in the visible updater; and the game launch callback can report the injection stage even when the native injector or DLL is missing. The authentication URL is also written to logs in some callback paths. Treat these as concrete review findings and verify/fix them before relying on this build with sensitive accounts or local files.
+
 Recommended maintenance approach:
 
 1. Identify the application-owned section before editing; do not treat bundled dependency code as application source.
@@ -1790,6 +1977,35 @@ The stylesheet is a large compiled CSS asset. It supplies styling for the render
 The asset directory includes images, icons, a GLB 3D asset, and other UI resources with generated or hashed filenames. Filenames indicate which files are included, but they do not establish which views reference them at runtime. Before deleting an apparently unused asset, search the compiled bundle and HTML/CSS references and test a complete packaged launch.
 
 Binary assets should be included in release review and tracked intentionally. Avoid replacing them with untrusted downloads or committing user data embedded in screenshots or image metadata.
+
+#### Checked-in renderer asset inventory
+
+The following inventory reflects the files and approximate sizes in this checkout. Descriptions are based on filenames and file type; confirm actual usage by searching the bundle before treating an asset as tied to a specific screen.
+
+| Asset | Approx. size | Likely role / notes |
+| --- | ---: | --- |
+| `index-Cmjydc3O.js` | 7.05 MB | Compiled React renderer, application screens, state and service integration, plus bundled dependencies. |
+| `index-ByT-tuHS.css` | 151 KB | Compiled renderer stylesheet, including utility classes, theme styling, responsive rules, and animations. |
+| `card-BP4TWJmK.glb` | 2.46 MB | Binary glTF 3D model; inspect renderer references and the model in a viewer to establish its exact scene role. |
+| `quest-B-roHW7d.png` | 938 KB | Quest-themed artwork by filename. |
+| `stairs-BnjnJdH2.png` | 82 KB | Stair/building-themed artwork by filename. |
+| `currency-CQhm-UnH.png` | 21 KB | Currency icon or artwork by filename. |
+| `wood-DfFKJk3w.png` | 24 KB | Wood/material artwork by filename. |
+| `era-logo-01-DShvfrht.png` | 13 KB | Era logo artwork. |
+| `lanyard-O8bUCbw4.png`, `lanyard-founder-GsGH-rjX.png` | 11 KB each | Lanyard and founder-lanyard artwork by filename. |
+| `victory-royale-C4nMOp_3.png` | 11 KB | Victory Royale artwork by filename. |
+| `ar-DDa27CbB.png` | 10 KB | Small AR-themed image or icon by filename. |
+| `sniper-D-iSN9Tw.png`, `smg-C-5YEhyV.png`, `shotgun-Dj-AEatf.png`, `rocket-BEmy1qe8.png` | 7–11 KB each | Weapon-themed artwork by filename. |
+
+The renderer HTML currently references `/assets/index-Cmjydc3O.js` and `/assets/index-ByT-tuHS.css`, while the logo and other artwork are expected to be referenced from the compiled bundle or styles. The HTML also points its favicon at `./src/favicon.svg`; that path is not present in the checked-in renderer file listing, so verify whether packaging supplies it or update the HTML/build output to a real icon. Keep the HTML references synchronized with hashed asset names after rebuilding.
+
+#### Reading the compiled JavaScript bundle
+
+At about 7 MB, the renderer bundle is a production artifact rather than a maintainable source tree. Application code and third-party code are packed together, and minification obscures component and variable names. The routes, service calls, authentication state, realtime subscriptions, and preload calls described in this README are observations from static inspection; a string or route definition alone does not prove that a user can reach the feature or that its backend operation succeeds.
+
+For a focused investigation, search distinctive UI labels and route paths, then trace the surrounding code to its data hook or event handler. Follow privileged actions from the renderer through `app/preload.js` to the matching `ipcMain` listener in `app/index.js`; follow API calls to their request client and response/error handling. For asset usage, search exact filenames and inspect the related component/style context. Do not infer the role of embedded dependency strings or source-map fragments as application features.
+
+The bundle may also contain implementation details that should be treated carefully during publication, such as service hostnames, telemetry configuration, OAuth flow metadata, or diagnostic messages. Review these values before making a repository public, and never commit live credentials or user-specific data. Reproducible source files and build tooling are preferable to editing the generated bundle directly.
 
 ### `app/workers/diskWriterWorker.js` — file allocation and chunk I/O
 
